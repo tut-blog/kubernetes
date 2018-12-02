@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package error describes errors in etcd project. When any change happens,
-// Documentation/errorcode.md needs to be updated correspondingly.
+// Documentation/v2/errorcode.md needs to be updated correspondingly.
 package error
 
 import (
@@ -154,9 +154,10 @@ func (e Error) StatusCode() int {
 	return status
 }
 
-func (e Error) WriteTo(w http.ResponseWriter) {
+func (e Error) WriteTo(w http.ResponseWriter) error {
 	w.Header().Add("X-Etcd-Index", fmt.Sprint(e.Index))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(e.StatusCode())
-	fmt.Fprintln(w, e.toJsonString())
+	_, err := w.Write([]byte(e.toJsonString() + "\n"))
+	return err
 }

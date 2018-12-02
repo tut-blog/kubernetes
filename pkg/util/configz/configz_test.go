@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ func TestConfigz(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	if string(body) != `{"testing":"blah"}` {
-		t.Fatalf("unexpected output: %v", err)
+		t.Fatalf("unexpected output: %s", body)
 	}
 
 	v.Set("bing")
@@ -58,7 +58,7 @@ func TestConfigz(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	if string(body) != `{"testing":"bing"}` {
-		t.Fatalf("unexpected output: %v", err)
+		t.Fatalf("unexpected output: %s", body)
 	}
 
 	Delete("testing")
@@ -72,6 +72,9 @@ func TestConfigz(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	if string(body) != `{}` {
-		t.Fatalf("unexpected output: %v", err)
+		t.Fatalf("unexpected output: %s", body)
+	}
+	if resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("unexpected Content-Type: %s", resp.Header.Get("Content-Type"))
 	}
 }

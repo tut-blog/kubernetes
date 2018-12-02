@@ -1,4 +1,4 @@
-# Copyright 2016 The Kubernetes Authors All rights reserved.
+# Copyright 2016 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM debian:jessie
-MAINTAINER Abhishek Shah "abshah@google.com"
+FROM BASEIMAGE
+
+CROSS_BUILD_COPY qemu-QEMUARCH-static /usr/bin/
+
+# WARNING: Please note that the script below removes the security packages from arm64 and ppc64el images
+# as they do not exist anymore in the debian repositories for jessie. So we do not recommend using this
+# image for any production use and limit use of this image to just test scenarios.
+
+COPY fixup-apt-list.sh /
+RUN ["/fixup-apt-list.sh"]
 
 RUN apt-get -q update && \
     apt-get install -y dnsutils && \

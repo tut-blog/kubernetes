@@ -1,4 +1,4 @@
-// Copyright 2016 CoreOS, Inc.
+// Copyright 2016 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,9 +33,6 @@ type Cluster interface {
 	// Member retrieves a particular member based on ID, or nil if the
 	// member does not exist in the cluster
 	Member(id types.ID) *membership.Member
-	// IsIDRemoved checks whether the given ID has been removed from this
-	// cluster at some point in the past
-	IsIDRemoved(id types.ID) bool
 	// Version is the cluster-wide minimum major.minor version.
 	Version() *semver.Version
 }

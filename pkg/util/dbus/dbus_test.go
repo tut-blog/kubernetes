@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,21 +25,16 @@ import (
 )
 
 const (
-	DBusNameFlagAllowReplacement uint32 = 1 << (iota + 1)
-	DBusNameFlagReplaceExisting
-	DBusNameFlagDoNotQueue
+	DBusNameFlagDoNotQueue uint32 = 1 << (iota + 1)
 )
 
 const (
 	DBusRequestNameReplyPrimaryOwner uint32 = iota + 1
-	DBusRequestNameReplyInQueue
-	DBusRequestNameReplyExists
 	DBusRequestNameReplyAlreadyOwner
 )
 
 const (
 	DBusReleaseNameReplyReleased uint32 = iota + 1
-	DBusReleaseNameReplyNonExistent
 	DBusReleaseNameReplyNotOwner
 )
 
@@ -214,9 +209,8 @@ func TestFakeDBus(t *testing.T) {
 				checkName := args[0].(string)
 				if checkName != ownedName {
 					return nil, godbus.Error{Name: "org.freedesktop.DBus.Error.NameHasNoOwner", Body: nil}
-				} else {
-					return []interface{}{uniqueName}, nil
 				}
+				return []interface{}{uniqueName}, nil
 			} else if method == "org.freedesktop.DBus.RequestName" {
 				reqName := args[0].(string)
 				_ = args[1].(uint32)

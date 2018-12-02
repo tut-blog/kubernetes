@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,12 +31,14 @@ find_files() {
   find . -not \( \
       \( \
         -wholename './output' \
+        -o -wholename './.git' \
         -o -wholename './_output' \
         -o -wholename './_gopath' \
         -o -wholename './release' \
         -o -wholename './target' \
         -o -wholename '*/third_party/*' \
         -o -wholename '*/vendor/*' \
+        -o -wholename './staging/src/k8s.io/client-go/*vendor/*' \
       \) -prune \
     \) -name '*.go'
 }

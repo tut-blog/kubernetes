@@ -18,24 +18,24 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/cadvisor/info/v1"
+	"k8s.io/klog"
 )
 
 func machineFsStatsFromV1(fsStats []v1.FsStats) []MachineFsStats {
 	var result []MachineFsStats
-	for _, stat := range fsStats {
+	for i := range fsStats {
+		stat := fsStats[i]
 		readDuration := time.Millisecond * time.Duration(stat.ReadTime)
 		writeDuration := time.Millisecond * time.Duration(stat.WriteTime)
 		ioDuration := time.Millisecond * time.Duration(stat.IoTime)
 		weightedDuration := time.Millisecond * time.Duration(stat.WeightedIoTime)
-		result = append(result, MachineFsStats{
-			Device:     stat.Device,
-			Type:       stat.Type,
-			Capacity:   &stat.Limit,
-			Usage:      &stat.Usage,
-			Available:  &stat.Available,
-			InodesFree: &stat.InodesFree,
+		machineFsStat := MachineFsStats{
+			Device:    stat.Device,
+			Type:      stat.Type,
+			Capacity:  &stat.Limit,
+			Usage:     &stat.Usage,
+			Available: &stat.Available,
 			DiskStats: DiskStats{
 				ReadsCompleted:     &stat.ReadsCompleted,
 				ReadsMerged:        &stat.ReadsMerged,
@@ -49,7 +49,11 @@ func machineFsStatsFromV1(fsStats []v1.FsStats) []MachineFsStats {
 				IoDuration:         &ioDuration,
 				WeightedIoDuration: &weightedDuration,
 			},
-		})
+		}
+		if stat.HasInodes {
+			machineFsStat.InodesFree = &stat.InodesFree
+		}
+		result = append(result, machineFsStat)
 	}
 	return result
 }
@@ -57,7 +61,8 @@ func machineFsStatsFromV1(fsStats []v1.FsStats) []MachineFsStats {
 func MachineStatsFromV1(cont *v1.ContainerInfo) []MachineStats {
 	var stats []MachineStats
 	var last *v1.ContainerStats
-	for _, val := range cont.Stats {
+	for i := range cont.Stats {
+		val := cont.Stats[i]
 		stat := MachineStats{
 			Timestamp: val.Timestamp,
 		}
@@ -65,7 +70,7 @@ func MachineStatsFromV1(cont *v1.ContainerInfo) []MachineStats {
 			stat.Cpu = &val.Cpu
 			cpuInst, err := InstCpuStats(last, val)
 			if err != nil {
-				glog.Warningf("Could not get instant cpu stats: %v", err)
+				klog.Warningf("Could not get instant cpu stats: %v", err)
 			} else {
 				stat.CpuInst = cpuInst
 			}
@@ -91,7 +96,7 @@ func MachineStatsFromV1(cont *v1.ContainerInfo) []MachineStats {
 	return stats
 }
 
-func ContainerStatsFromV1(spec *v1.ContainerSpec, stats []*v1.ContainerStats) []*ContainerStats {
+func ContainerStatsFromV1(containerName string, spec *v1.ContainerSpec, stats []*v1.ContainerStats) []*ContainerStats {
 	newStats := make([]*ContainerStats, 0, len(stats))
 	var last *v1.ContainerStats
 	for _, val := range stats {
@@ -102,7 +107,7 @@ func ContainerStatsFromV1(spec *v1.ContainerSpec, stats []*v1.ContainerStats) []
 			stat.Cpu = &val.Cpu
 			cpuInst, err := InstCpuStats(last, val)
 			if err != nil {
-				glog.Warningf("Could not get instant cpu stats: %v", err)
+				klog.Warningf("Could not get instant cpu stats: %v", err)
 			} else {
 				stat.CpuInst = cpuInst
 			}
@@ -114,6 +119,8 @@ func ContainerStatsFromV1(spec *v1.ContainerSpec, stats []*v1.ContainerStats) []
 		if spec.HasNetwork {
 			// TODO: Handle TcpStats
 			stat.Network = &NetworkStats{
+				Tcp:        TcpStat(val.Network.Tcp),
+				Tcp6:       TcpStat(val.Network.Tcp6),
 				Interfaces: val.Network.Interfaces,
 			}
 		}
@@ -122,10 +129,11 @@ func ContainerStatsFromV1(spec *v1.ContainerSpec, stats []*v1.ContainerStats) []
 				stat.Filesystem = &FilesystemStats{
 					TotalUsageBytes: &val.Filesystem[0].Usage,
 					BaseUsageBytes:  &val.Filesystem[0].BaseUsage,
+					InodeUsage:      &val.Filesystem[0].Inodes,
 				}
-			} else if len(val.Filesystem) > 1 {
+			} else if len(val.Filesystem) > 1 && containerName != "/" {
 				// Cannot handle multiple devices per container.
-				glog.V(2).Infof("failed to handle multiple devices for container. Skipping Filesystem stats")
+				klog.V(4).Infof("failed to handle multiple devices for container %s. Skipping Filesystem stats", containerName)
 			}
 		}
 		if spec.HasDiskIo {
@@ -133,6 +141,9 @@ func ContainerStatsFromV1(spec *v1.ContainerSpec, stats []*v1.ContainerStats) []
 		}
 		if spec.HasCustomMetrics {
 			stat.CustomMetrics = val.CustomMetrics
+		}
+		if len(val.Accelerators) > 0 {
+			stat.Accelerators = val.Accelerators
 		}
 		// TODO(rjnagal): Handle load stats.
 		newStats = append(newStats, stat)
@@ -157,7 +168,7 @@ func DeprecatedStatsFromV1(cont *v1.ContainerInfo) []DeprecatedContainerStats {
 			stat.Cpu = val.Cpu
 			cpuInst, err := InstCpuStats(last, val)
 			if err != nil {
-				glog.Warningf("Could not get instant cpu stats: %v", err)
+				klog.Warningf("Could not get instant cpu stats: %v", err)
 			} else {
 				stat.CpuInst = cpuInst
 			}
@@ -195,9 +206,6 @@ func InstCpuStats(last, cur *v1.ContainerStats) (*CpuInstStats, error) {
 		return nil, fmt.Errorf("different number of cpus")
 	}
 	timeDelta := cur.Timestamp.Sub(last.Timestamp)
-	if timeDelta <= 100*time.Millisecond {
-		return nil, fmt.Errorf("time delta unexpectedly small")
-	}
 	// Nanoseconds to gain precision and avoid having zero seconds if the
 	// difference between the timestamps is just under a second
 	timeDeltaNs := uint64(timeDelta.Nanoseconds())
@@ -251,6 +259,7 @@ func ContainerSpecFromV1(specV1 *v1.ContainerSpec, aliases []string, namespace s
 		HasCustomMetrics: specV1.HasCustomMetrics,
 		Image:            specV1.Image,
 		Labels:           specV1.Labels,
+		Envs:             specV1.Envs,
 	}
 	if specV1.HasCpu {
 		specV2.Cpu.Limit = specV1.Cpu.Limit

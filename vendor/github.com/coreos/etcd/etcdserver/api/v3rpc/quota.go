@@ -1,4 +1,4 @@
-// Copyright 2016 CoreOS, Inc.
+// Copyright 2016 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,12 @@
 package v3rpc
 
 import (
+	"context"
+
 	"github.com/coreos/etcd/etcdserver"
 	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/pkg/types"
-	"golang.org/x/net/context"
 )
 
 type quotaKVServer struct {
@@ -45,7 +46,7 @@ func (qa *quotaAlarmer) check(ctx context.Context, r interface{}) error {
 		Alarm:    pb.AlarmType_NOSPACE,
 	}
 	qa.a.Alarm(ctx, req)
-	return rpctypes.ErrNoSpace
+	return rpctypes.ErrGRPCNoSpace
 }
 
 func NewQuotaKVServer(s *etcdserver.EtcdServer) pb.KVServer {

@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,11 +22,13 @@ import (
 	"path"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	utiltesting "k8s.io/client-go/util/testing"
+	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/kubernetes/pkg/cloudprovider/providers/fake"
+	"k8s.io/kubernetes/pkg/cloudprovider/providers/vsphere"
 	"k8s.io/kubernetes/pkg/util/mount"
-	utiltesting "k8s.io/kubernetes/pkg/util/testing"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
@@ -38,7 +40,7 @@ func TestCanSupport(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), volumetest.NewFakeVolumeHost(tmpDir, nil, nil, "" /* rootContext */))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/vsphere-volume")
 	if err != nil {
@@ -48,58 +50,31 @@ func TestCanSupport(t *testing.T) {
 		t.Errorf("Wrong name: %s", plug.GetPluginName())
 	}
 
-	if !plug.CanSupport(&volume.Spec{Volume: &api.Volume{VolumeSource: api.VolumeSource{VsphereVolume: &api.VsphereVirtualDiskVolumeSource{}}}}) {
+	if !plug.CanSupport(&volume.Spec{Volume: &v1.Volume{VolumeSource: v1.VolumeSource{VsphereVolume: &v1.VsphereVirtualDiskVolumeSource{}}}}) {
 		t.Errorf("Expected true")
 	}
 
-	if !plug.CanSupport(&volume.Spec{PersistentVolume: &api.PersistentVolume{Spec: api.PersistentVolumeSpec{PersistentVolumeSource: api.PersistentVolumeSource{VsphereVolume: &api.VsphereVirtualDiskVolumeSource{}}}}}) {
+	if !plug.CanSupport(&volume.Spec{PersistentVolume: &v1.PersistentVolume{Spec: v1.PersistentVolumeSpec{PersistentVolumeSource: v1.PersistentVolumeSource{VsphereVolume: &v1.VsphereVirtualDiskVolumeSource{}}}}}) {
 		t.Errorf("Expected true")
 	}
 }
 
 type fakePDManager struct {
-	attachCalled bool
-	detachCalled bool
 }
 
 func getFakeDeviceName(host volume.VolumeHost, volPath string) string {
 	return path.Join(host.GetPluginDir(vsphereVolumePluginName), "device", volPath)
 }
 
-func (fake *fakePDManager) AttachDisk(b *vsphereVolumeMounter, globalPDPath string) error {
-	fakeDeviceName := getFakeDeviceName(b.plugin.host, b.volPath)
-	err := os.MkdirAll(fakeDeviceName, 0750)
-	if err != nil {
-		return err
+func (fake *fakePDManager) CreateVolume(v *vsphereVolumeProvisioner) (volSpec *VolumeSpec, err error) {
+	volSpec = &VolumeSpec{
+		Path:              "[local] test-volume-name.vmdk",
+		Size:              100,
+		Fstype:            "ext4",
+		StoragePolicyName: "gold",
+		StoragePolicyID:   "1234",
 	}
-	fake.attachCalled = true
-	// Simulate the global mount so that the fakeMounter returns the
-	// expected number of mounts for the attached disk.
-	err = b.mounter.Mount(fakeDeviceName, globalPDPath, "", []string{"bind"})
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (fake *fakePDManager) DetachDisk(v *vsphereVolumeUnmounter) error {
-	globalPath := makeGlobalPDPath(v.plugin.host, v.volPath)
-	fakeDeviceName := getFakeDeviceName(v.plugin.host, v.volPath)
-	err := v.mounter.Unmount(globalPath)
-	if err != nil {
-		return err
-	}
-	// "Detach" the fake "device"
-	err = os.RemoveAll(fakeDeviceName)
-	if err != nil {
-		return err
-	}
-	fake.detachCalled = true
-	return nil
-}
-
-func (fake *fakePDManager) CreateVolume(v *vsphereVolumeProvisioner) (vmDiskPath string, volumeSizeKB int, err error) {
-	return "[local] test-volume-name.vmdk", 100, nil
+	return volSpec, nil
 }
 
 func (fake *fakePDManager) DeleteVolume(vd *vsphereVolumeDeleter) error {
@@ -118,17 +93,17 @@ func TestPlugin(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), volumetest.NewFakeVolumeHost(tmpDir, nil, nil, "" /* rootContext */))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/vsphere-volume")
 	if err != nil {
 		t.Errorf("Can't find the plugin by name")
 	}
 
-	spec := &api.Volume{
+	spec := &v1.Volume{
 		Name: "vol1",
-		VolumeSource: api.VolumeSource{
-			VsphereVolume: &api.VsphereVirtualDiskVolumeSource{
+		VolumeSource: v1.VolumeSource{
+			VsphereVolume: &v1.VsphereVirtualDiskVolumeSource{
 				VolumePath: "[local] test-volume-name.vmdk",
 				FSType:     "ext4",
 			},
@@ -156,10 +131,6 @@ func TestPlugin(t *testing.T) {
 		t.Errorf("Expected success, got: %v", err)
 	}
 
-	if !fakeManager.attachCalled {
-		t.Errorf("Attach watch not called")
-	}
-
 	// Test Unmounter
 	fakeManager = &fakePDManager{}
 	unmounter, err := plug.(*vsphereVolumePlugin).newUnmounterInternal("vol1", types.UID("poduid"), fakeManager, fakeMounter)
@@ -176,23 +147,19 @@ func TestPlugin(t *testing.T) {
 	if _, err := os.Stat(path); err == nil {
 		t.Errorf("TearDown() failed, volume path still exists: %s", path)
 	} else if !os.IsNotExist(err) {
-		t.Errorf("SetUp() failed: %v", err)
-	}
-	if !fakeManager.detachCalled {
-		t.Errorf("Detach watch not called")
+		t.Errorf("TearDown() failed: %v", err)
 	}
 
 	// Test Provisioner
-	cap := resource.MustParse("100Mi")
 	options := volume.VolumeOptions{
-		Capacity: cap,
-		AccessModes: []api.PersistentVolumeAccessMode{
-			api.ReadWriteOnce,
-		},
-		PersistentVolumeReclaimPolicy: api.PersistentVolumeReclaimDelete,
+		PVC:                           volumetest.CreateTestPVC("100Mi", []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}),
+		PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
 	}
 	provisioner, err := plug.(*vsphereVolumePlugin).newProvisionerInternal(options, &fakePDManager{})
-	persistentSpec, err := provisioner.Provision()
+	if err != nil {
+		t.Errorf("newProvisionerInternal() failed: %v", err)
+	}
+	persistentSpec, err := provisioner.Provision(nil, nil)
 	if err != nil {
 		t.Errorf("Provision() failed: %v", err)
 	}
@@ -201,7 +168,11 @@ func TestPlugin(t *testing.T) {
 		t.Errorf("Provision() returned unexpected path %s", persistentSpec.Spec.PersistentVolumeSource.VsphereVolume.VolumePath)
 	}
 
-	cap = persistentSpec.Spec.Capacity[api.ResourceStorage]
+	if persistentSpec.Spec.PersistentVolumeSource.VsphereVolume.StoragePolicyName != "gold" {
+		t.Errorf("Provision() returned unexpected storagepolicy name %s", persistentSpec.Spec.PersistentVolumeSource.VsphereVolume.StoragePolicyName)
+	}
+
+	cap := persistentSpec.Spec.Capacity[v1.ResourceStorage]
 	size := cap.Value()
 	if size != 100*1024 {
 		t.Errorf("Provision() returned unexpected volume size: %v", size)
@@ -212,8 +183,57 @@ func TestPlugin(t *testing.T) {
 		PersistentVolume: persistentSpec,
 	}
 	deleter, err := plug.(*vsphereVolumePlugin).newDeleterInternal(volSpec, &fakePDManager{})
+	if err != nil {
+		t.Errorf("newDeleterInternal() failed: %v", err)
+	}
 	err = deleter.Delete()
 	if err != nil {
 		t.Errorf("Deleter() failed: %v", err)
+	}
+}
+
+func TestUnsupportedCloudProvider(t *testing.T) {
+	// Initial setup to test volume plugin
+	tmpDir, err := utiltesting.MkTmpdir("vsphereVolumeTest")
+	if err != nil {
+		t.Fatalf("can't make a temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	testcases := []struct {
+		name          string
+		cloudProvider cloudprovider.Interface
+		success       bool
+	}{
+		{name: "nil cloudprovider", cloudProvider: nil},
+		{name: "vSphere", cloudProvider: &vsphere.VSphere{}, success: true},
+		{name: "fake cloudprovider", cloudProvider: &fake.FakeCloud{}},
+	}
+
+	for _, tc := range testcases {
+		t.Logf("test case: %v", tc.name)
+
+		plugMgr := volume.VolumePluginMgr{}
+		plugMgr.InitPlugins(ProbeVolumePlugins(), nil, /* prober */
+			volumetest.NewFakeVolumeHostWithCloudProvider(tmpDir, nil, nil, tc.cloudProvider))
+
+		plug, err := plugMgr.FindAttachablePluginByName("kubernetes.io/vsphere-volume")
+		if err != nil {
+			t.Errorf("Can't find the plugin by name")
+		}
+
+		_, err = plug.NewAttacher()
+		if !tc.success && err == nil {
+			t.Errorf("expected error when creating attacher due to incorrect cloud provider, but got none")
+		} else if tc.success && err != nil {
+			t.Errorf("expected no error when creating attacher, but got error: %v", err)
+		}
+
+		_, err = plug.NewDetacher()
+		if !tc.success && err == nil {
+			t.Errorf("expected error when creating detacher due to incorrect cloud provider, but got none")
+		} else if tc.success && err != nil {
+			t.Errorf("expected no error when creating detacher, but got error: %v", err)
+		}
 	}
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,70 @@ limitations under the License.
 package gce
 
 import (
+	"context"
 	"reflect"
+	"strings"
 	"testing"
 
-	compute "google.golang.org/api/compute/v1"
-	"k8s.io/kubernetes/pkg/util/rand"
+	"golang.org/x/oauth2/google"
+
+	cloudprovider "k8s.io/cloud-provider"
 )
+
+func TestReadConfigFile(t *testing.T) {
+	const s = `[Global]
+token-url = my-token-url
+token-body = my-token-body
+project-id = my-project
+network-project-id = my-network-project
+network-name = my-network
+subnetwork-name = my-subnetwork
+secondary-range-name = my-secondary-range
+node-tags = my-node-tag1
+node-instance-prefix = my-prefix
+multizone = true
+regional = true
+   `
+	reader := strings.NewReader(s)
+	config, err := readConfig(reader)
+	if err != nil {
+		t.Fatalf("Unexpected config parsing error %v", err)
+	}
+
+	expected := &ConfigFile{Global: ConfigGlobal{
+		TokenURL:           "my-token-url",
+		TokenBody:          "my-token-body",
+		ProjectID:          "my-project",
+		NetworkProjectID:   "my-network-project",
+		NetworkName:        "my-network",
+		SubnetworkName:     "my-subnetwork",
+		SecondaryRangeName: "my-secondary-range",
+		NodeTags:           []string{"my-node-tag1"},
+		NodeInstancePrefix: "my-prefix",
+		Multizone:          true,
+		Regional:           true,
+	}}
+
+	if !reflect.DeepEqual(expected, config) {
+		t.Fatalf("Expected config file values to be read into ConfigFile struct.  \nExpected:\n%+v\nActual:\n%+v", expected, config)
+	}
+}
+
+func TestExtraKeyInConfig(t *testing.T) {
+	const s = `[Global]
+project-id = my-project
+unknown-key = abc
+network-name = my-network
+   `
+	reader := strings.NewReader(s)
+	config, err := readConfig(reader)
+	if err != nil {
+		t.Fatalf("Unexpected config parsing error %v", err)
+	}
+	if config.Global.ProjectID != "my-project" || config.Global.NetworkName != "my-network" {
+		t.Fatalf("Expected config values to continue to be read despite extra key-value pair.")
+	}
+}
 
 func TestGetRegion(t *testing.T) {
 	zoneName := "us-central1-b"
@@ -33,7 +91,7 @@ func TestGetRegion(t *testing.T) {
 	if regionName != "us-central1" {
 		t.Errorf("Unexpected region from GetGCERegion: %s", regionName)
 	}
-	gce := &GCECloud{
+	gce := &Cloud{
 		localZone: zoneName,
 		region:    regionName,
 	}
@@ -41,7 +99,7 @@ func TestGetRegion(t *testing.T) {
 	if !ok {
 		t.Fatalf("Unexpected missing zones impl")
 	}
-	zone, err := zones.GetZone()
+	zone, err := zones.GetZone(context.TODO())
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
@@ -116,157 +174,429 @@ func TestComparingHostURLs(t *testing.T) {
 	}
 }
 
-func TestScrubDNS(t *testing.T) {
-	tcs := []struct {
-		nameserversIn  []string
-		searchesIn     []string
-		nameserversOut []string
-		searchesOut    []string
+func TestSplitProviderID(t *testing.T) {
+	providers := []struct {
+		providerID string
+
+		project  string
+		zone     string
+		instance string
+
+		fail bool
 	}{
 		{
-			nameserversIn:  []string{"1.2.3.4", "5.6.7.8"},
-			nameserversOut: []string{"1.2.3.4", "5.6.7.8"},
+			providerID: ProviderName + "://project-example-164317/us-central1-f/kubernetes-node-fhx1",
+			project:    "project-example-164317",
+			zone:       "us-central1-f",
+			instance:   "kubernetes-node-fhx1",
+			fail:       false,
 		},
 		{
-			searchesIn:  []string{"c.prj.internal.", "12345678910.google.internal.", "google.internal."},
-			searchesOut: []string{"c.prj.internal.", "google.internal."},
+			providerID: ProviderName + "://project-example.164317/us-central1-f/kubernetes-node-fhx1",
+			project:    "project-example.164317",
+			zone:       "us-central1-f",
+			instance:   "kubernetes-node-fhx1",
+			fail:       false,
 		},
 		{
-			searchesIn:  []string{"c.prj.internal.", "12345678910.google.internal.", "zone.c.prj.internal.", "google.internal."},
-			searchesOut: []string{"c.prj.internal.", "zone.c.prj.internal.", "google.internal."},
+			providerID: ProviderName + "://project-example-164317/us-central1-fkubernetes-node-fhx1",
+			project:    "",
+			zone:       "",
+			instance:   "",
+			fail:       true,
 		},
 		{
-			searchesIn:  []string{"c.prj.internal.", "12345678910.google.internal.", "zone.c.prj.internal.", "google.internal.", "unexpected"},
-			searchesOut: []string{"c.prj.internal.", "zone.c.prj.internal.", "google.internal.", "unexpected"},
+			providerID: ProviderName + ":/project-example-164317/us-central1-f/kubernetes-node-fhx1",
+			project:    "",
+			zone:       "",
+			instance:   "",
+			fail:       true,
+		},
+		{
+			providerID: "aws://project-example-164317/us-central1-f/kubernetes-node-fhx1",
+			project:    "",
+			zone:       "",
+			instance:   "",
+			fail:       true,
+		},
+		{
+			providerID: ProviderName + "://project-example-164317/us-central1-f/kubernetes-node-fhx1/",
+			project:    "",
+			zone:       "",
+			instance:   "",
+			fail:       true,
+		},
+		{
+			providerID: ProviderName + "://project-example.164317//kubernetes-node-fhx1",
+			project:    "",
+			zone:       "",
+			instance:   "",
+			fail:       true,
+		},
+		{
+			providerID: ProviderName + "://project-example.164317/kubernetes-node-fhx1",
+			project:    "",
+			zone:       "",
+			instance:   "",
+			fail:       true,
 		},
 	}
-	gce := &GCECloud{}
-	for i := range tcs {
-		n, s := gce.ScrubDNS(tcs[i].nameserversIn, tcs[i].searchesIn)
-		if !reflect.DeepEqual(n, tcs[i].nameserversOut) {
-			t.Errorf("Expected %v, got %v", tcs[i].nameserversOut, n)
+
+	for _, test := range providers {
+		project, zone, instance, err := splitProviderID(test.providerID)
+		if (err != nil) != test.fail {
+			t.Errorf("Expected to fail=%t, with pattern %v", test.fail, test)
 		}
-		if !reflect.DeepEqual(s, tcs[i].searchesOut) {
-			t.Errorf("Expected %v, got %v", tcs[i].searchesOut, s)
+
+		if test.fail {
+			continue
+		}
+
+		if project != test.project {
+			t.Errorf("Expected %v, but got %v", test.project, project)
+		}
+		if zone != test.zone {
+			t.Errorf("Expected %v, but got %v", test.zone, zone)
+		}
+		if instance != test.instance {
+			t.Errorf("Expected %v, but got %v", test.instance, instance)
 		}
 	}
 }
 
-func TestCreateFirewallFails(t *testing.T) {
-	name := "loadbalancer"
-	region := "us-central1"
-	desc := "description"
-	gce := &GCECloud{}
-	if err := gce.createFirewall(name, region, desc, nil, nil, nil); err == nil {
-		t.Errorf("error expected when creating firewall without any tags found")
-	}
-}
-
-func TestRestrictTargetPool(t *testing.T) {
-	const maxInstances = 5
+func TestGetZoneByProviderID(t *testing.T) {
 	tests := []struct {
-		instances []string
-		want      []string
+		providerID string
+
+		expectedZone cloudprovider.Zone
+
+		fail        bool
+		description string
 	}{
 		{
-			instances: []string{"1", "2", "3", "4", "5"},
-			want:      []string{"1", "2", "3", "4", "5"},
+			providerID:   ProviderName + "://project-example-164317/us-central1-f/kubernetes-node-fhx1",
+			expectedZone: cloudprovider.Zone{FailureDomain: "us-central1-f", Region: "us-central1"},
+			fail:         false,
+			description:  "standard gce providerID",
 		},
 		{
-			instances: []string{"1", "2", "3", "4", "5", "6"},
-			want:      []string{"4", "3", "5", "2", "6"},
+			providerID:   ProviderName + "://project-example-164317/us-central1-f/kubernetes-node-fhx1/",
+			expectedZone: cloudprovider.Zone{},
+			fail:         true,
+			description:  "too many slashes('/') trailing",
+		},
+		{
+			providerID:   ProviderName + "://project-example.164317//kubernetes-node-fhx1",
+			expectedZone: cloudprovider.Zone{},
+			fail:         true,
+			description:  "too many slashes('/') embedded",
+		},
+		{
+			providerID:   ProviderName + "://project-example-164317/uscentral1f/kubernetes-node-fhx1",
+			expectedZone: cloudprovider.Zone{},
+			fail:         true,
+			description:  "invalid name of the GCE zone",
 		},
 	}
-	for _, tc := range tests {
-		rand.Seed(5)
-		got := restrictTargetPool(append([]string{}, tc.instances...), maxInstances)
-		if !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("restrictTargetPool(%v) => %v, want %v", tc.instances, got, tc.want)
+
+	gce := &Cloud{
+		localZone: "us-central1-f",
+		region:    "us-central1",
+	}
+	for _, test := range tests {
+		zone, err := gce.GetZoneByProviderID(context.TODO(), test.providerID)
+		if (err != nil) != test.fail {
+			t.Errorf("Expected to fail=%t, provider ID %v, tests %s", test.fail, test, test.description)
+		}
+
+		if test.fail {
+			continue
+		}
+
+		if zone != test.expectedZone {
+			t.Errorf("Expected %v, but got %v", test.expectedZone, zone)
 		}
 	}
 }
 
-func TestComputeUpdate(t *testing.T) {
-	const maxInstances = 5
-	const fakeZone = "us-moon1-f"
-	tests := []struct {
-		tp           []string
-		instances    []string
-		wantToAdd    []string
-		wantToRemove []string
+func TestGenerateCloudConfigs(t *testing.T) {
+	configBoilerplate := ConfigGlobal{
+		TokenURL:           "",
+		TokenBody:          "",
+		ProjectID:          "project-id",
+		NetworkName:        "network-name",
+		SubnetworkName:     "",
+		SecondaryRangeName: "",
+		NodeTags:           []string{"node-tag"},
+		NodeInstancePrefix: "node-prefix",
+		Multizone:          false,
+		Regional:           false,
+		APIEndpoint:        "",
+		LocalZone:          "us-central1-a",
+		AlphaFeatures:      []string{},
+	}
+
+	cloudBoilerplate := CloudConfig{
+		APIEndpoint:        "",
+		ProjectID:          "project-id",
+		NetworkProjectID:   "",
+		Region:             "us-central1",
+		Zone:               "us-central1-a",
+		ManagedZones:       []string{"us-central1-a"},
+		NetworkName:        "network-name",
+		SubnetworkName:     "",
+		NetworkURL:         "",
+		SubnetworkURL:      "",
+		SecondaryRangeName: "",
+		NodeTags:           []string{"node-tag"},
+		TokenSource:        google.ComputeTokenSource(""),
+		NodeInstancePrefix: "node-prefix",
+		UseMetadataServer:  true,
+		AlphaFeatureGate:   &AlphaFeatureGate{map[string]bool{}},
+	}
+
+	testCases := []struct {
+		name   string
+		config func() ConfigGlobal
+		cloud  func() CloudConfig
 	}{
 		{
-			// Test adding all instances.
-			tp:           []string{},
-			instances:    []string{"0", "1", "2"},
-			wantToAdd:    []string{"0", "1", "2"},
-			wantToRemove: []string{},
+			name:   "Empty Config",
+			config: func() ConfigGlobal { return configBoilerplate },
+			cloud:  func() CloudConfig { return cloudBoilerplate },
 		},
 		{
-			// Test node 1 coming back healthy.
-			tp:           []string{"0", "2"},
-			instances:    []string{"0", "1", "2"},
-			wantToAdd:    []string{"1"},
-			wantToRemove: []string{},
+			name: "Nil token URL",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.TokenURL = "nil"
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.TokenSource = nil
+				return v
+			},
 		},
 		{
-			// Test node 1 going healthy while node 4 needs to be removed.
-			tp:           []string{"0", "2", "4"},
-			instances:    []string{"0", "1", "2"},
-			wantToAdd:    []string{"1"},
-			wantToRemove: []string{"4"},
+			name: "Network Project ID",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.NetworkProjectID = "my-awesome-project"
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.NetworkProjectID = "my-awesome-project"
+				return v
+			},
 		},
 		{
-			// Test exceeding the TargetPool max of 5 (for the test),
-			// which shuffles in 7, 5, 8 based on the deterministic
-			// seed below.
-			tp:           []string{"0", "2", "4", "6"},
-			instances:    []string{"0", "1", "2", "3", "5", "7", "8"},
-			wantToAdd:    []string{"7", "5", "8"},
-			wantToRemove: []string{"4", "6"},
+			name: "Specified API Endpint",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.APIEndpoint = "https://www.googleapis.com/compute/staging_v1/"
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.APIEndpoint = "https://www.googleapis.com/compute/staging_v1/"
+				return v
+			},
 		},
 		{
-			// Test all nodes getting removed.
-			tp:           []string{"0", "1", "2", "3"},
-			instances:    []string{},
-			wantToAdd:    []string{},
-			wantToRemove: []string{"0", "1", "2", "3"},
+			name: "Network & Subnetwork names",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.NetworkName = "my-network"
+				v.SubnetworkName = "my-subnetwork"
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.NetworkName = "my-network"
+				v.SubnetworkName = "my-subnetwork"
+				return v
+			},
+		},
+		{
+			name: "Network & Subnetwork URLs",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.NetworkName = "https://www.googleapis.com/compute/v1/projects/project-id/global/networks/my-network"
+				v.SubnetworkName = "https://www.googleapis.com/compute/v1/projects/project-id/regions/us-central1/subnetworks/my-subnetwork"
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.NetworkName = ""
+				v.SubnetworkName = ""
+				v.NetworkURL = "https://www.googleapis.com/compute/v1/projects/project-id/global/networks/my-network"
+				v.SubnetworkURL = "https://www.googleapis.com/compute/v1/projects/project-id/regions/us-central1/subnetworks/my-subnetwork"
+				return v
+			},
+		},
+		{
+			name: "Multizone",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.Multizone = true
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.ManagedZones = nil
+				return v
+			},
+		},
+		{
+			name: "Regional",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.Regional = true
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.Regional = true
+				v.ManagedZones = nil
+				return v
+			},
+		},
+		{
+			name: "Secondary Range Name",
+			config: func() ConfigGlobal {
+				v := configBoilerplate
+				v.SecondaryRangeName = "my-secondary"
+				return v
+			},
+			cloud: func() CloudConfig {
+				v := cloudBoilerplate
+				v.SecondaryRangeName = "my-secondary"
+				return v
+			},
 		},
 	}
-	for _, tc := range tests {
-		rand.Seed(5) // Arbitrary RNG seed for deterministic testing.
 
-		// Dummy up the gceInstance slice.
-		var instances []*gceInstance
-		for _, inst := range tc.instances {
-			instances = append(instances, &gceInstance{Name: inst, Zone: fakeZone})
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resultCloud, err := generateCloudConfig(&ConfigFile{Global: tc.config()})
+			if err != nil {
+				t.Fatalf("Unexpect error: %v", err)
+			}
+
+			v := tc.cloud()
+			if !reflect.DeepEqual(*resultCloud, v) {
+				t.Errorf("Got: \n%v\nWant\n%v\n", v, *resultCloud)
+			}
+		})
+	}
+}
+
+func TestNewAlphaFeatureGate(t *testing.T) {
+	testCases := []struct {
+		alphaFeatures  []string
+		expectEnabled  []string
+		expectDisabled []string
+	}{
+		// enable foo bar
+		{
+			alphaFeatures:  []string{"foo", "bar"},
+			expectEnabled:  []string{"foo", "bar"},
+			expectDisabled: []string{"aaa"},
+		},
+		// no alpha feature
+		{
+			alphaFeatures:  []string{},
+			expectEnabled:  []string{},
+			expectDisabled: []string{"foo", "bar"},
+		},
+		// unsupported alpha feature
+		{
+			alphaFeatures:  []string{"aaa", "foo"},
+			expectEnabled:  []string{"foo"},
+			expectDisabled: []string{},
+		},
+		// enable foo
+		{
+			alphaFeatures:  []string{"foo"},
+			expectEnabled:  []string{"foo"},
+			expectDisabled: []string{"bar"},
+		},
+	}
+
+	for _, tc := range testCases {
+		featureGate := NewAlphaFeatureGate(tc.alphaFeatures)
+
+		for _, key := range tc.expectEnabled {
+			if !featureGate.Enabled(key) {
+				t.Errorf("Expect %q to be enabled.", key)
+			}
 		}
-		// Dummy up the TargetPool URL list.
-		var urls []string
-		for _, inst := range tc.tp {
-			inst := &gceInstance{Name: inst, Zone: fakeZone}
-			urls = append(urls, inst.makeComparableHostPath())
+		for _, key := range tc.expectDisabled {
+			if featureGate.Enabled(key) {
+				t.Errorf("Expect %q to be disabled.", key)
+			}
 		}
-		gotAddInsts, gotRem := computeUpdate(&compute.TargetPool{Instances: urls}, instances, maxInstances)
-		var wantAdd []string
-		for _, inst := range tc.wantToAdd {
-			inst := &gceInstance{Name: inst, Zone: fakeZone}
-			wantAdd = append(wantAdd, inst.makeComparableHostPath())
+	}
+}
+
+func TestGetRegionInURL(t *testing.T) {
+	cases := map[string]string{
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/a": "us-central1",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-west2/subnetworks/b":    "us-west2",
+		"projects/my-project/regions/asia-central1/subnetworks/c":                                     "asia-central1",
+		"regions/europe-north2": "europe-north2",
+		"my-url":                "",
+		"":                      "",
+	}
+	for input, output := range cases {
+		result := getRegionInURL(input)
+		if result != output {
+			t.Errorf("Actual result %q does not match expected result %q for input: %q", result, output, input)
 		}
-		var gotAdd []string
-		for _, inst := range gotAddInsts {
-			gotAdd = append(gotAdd, inst.Instance)
+	}
+}
+
+func TestFindSubnetForRegion(t *testing.T) {
+	s := []string{
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/default-38b01f54907a15a7",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-west1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-east1/subnetworks/default-277eec3815f742b6",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-east4/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-northeast1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-east1/subnetworks/default-8e020b4b8b244809",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/australia-southeast1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/southamerica-east1/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/europe-west3/subnetworks/default",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-southeast1/subnetworks/default",
+		"",
+	}
+	actual := findSubnetForRegion(s, "asia-east1")
+	expectedResult := "https://www.googleapis.com/compute/v1/projects/my-project/regions/asia-east1/subnetworks/default-8e020b4b8b244809"
+	if actual != expectedResult {
+		t.Errorf("Actual result %q does not match expected result %q", actual, expectedResult)
+	}
+
+	var nilSlice []string
+	res := findSubnetForRegion(nilSlice, "us-central1")
+	if res != "" {
+		t.Errorf("expected an empty result, got %v", res)
+	}
+}
+
+func TestLastComponent(t *testing.T) {
+	cases := map[string]string{
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/a": "a",
+		"https://www.googleapis.com/compute/v1/projects/my-project/regions/us-central1/subnetworks/b": "b",
+		"projects/my-project/regions/us-central1/subnetworks/c":                                       "c",
+		"d": "d",
+		"":  "",
+	}
+	for input, output := range cases {
+		result := lastComponent(input)
+		if result != output {
+			t.Errorf("Actual result %q does not match expected result %q for input: %q", result, output, input)
 		}
-		if !reflect.DeepEqual(wantAdd, gotAdd) {
-			t.Errorf("computeTargetPool(%v, %v) => added %v, wanted %v", tc.tp, tc.instances, gotAdd, wantAdd)
-		}
-		_ = gotRem
-		// var gotRem []string
-		// for _, inst := range gotRemInsts {
-		// 	gotRem = append(gotRem, inst.Instance)
-		// }
-		// if !reflect.DeepEqual(tc.wantToRemove, gotRem) {
-		// 	t.Errorf("computeTargetPool(%v, %v) => removed %v, wanted %v", tc.tp, tc.instances, gotRem, tc.wantToRemove)
-		// }
 	}
 }

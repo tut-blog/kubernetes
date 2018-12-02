@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,9 +27,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 
-	"k8s.io/kubernetes/pkg/util/term"
+	"k8s.io/kubernetes/pkg/kubectl/util/term"
 )
 
 const (
@@ -124,7 +124,7 @@ func (e Editor) Launch(path string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-	glog.V(5).Infof("Opening file with editor %v", args)
+	klog.V(5).Infof("Opening file with editor %v", args)
 	if err := (term.TTY{In: os.Stdin, TryDev: true}).Safe(cmd.Run); err != nil {
 		if err, ok := err.(*exec.Error); ok {
 			if err.Err == exec.ErrNotFound {

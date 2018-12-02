@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,11 +25,11 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/util/diff"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util"
-	"k8s.io/kubernetes/pkg/util/diff"
 )
 
 const (
@@ -39,12 +39,12 @@ const (
 type TestGenericPLEG struct {
 	pleg    *GenericPLEG
 	runtime *containertest.FakeRuntime
-	clock   *util.FakeClock
+	clock   *clock.FakeClock
 }
 
 func newTestGenericPLEG() *TestGenericPLEG {
 	fakeRuntime := &containertest.FakeRuntime{}
-	clock := util.NewFakeClock(time.Time{})
+	clock := clock.NewFakeClock(time.Time{})
 	// The channel capacity should be large enough to hold all events in a
 	// single test.
 	pleg := &GenericPLEG{
@@ -97,21 +97,21 @@ func TestRelisting(t *testing.T) {
 	pleg, runtime := testPleg.pleg, testPleg.runtime
 	ch := pleg.Watch()
 	// The first relist should send a PodSync event to each pod.
-	runtime.AllPodList = []*kubecontainer.Pod{
-		{
+	runtime.AllPodList = []*containertest.FakePod{
+		{Pod: &kubecontainer.Pod{
 			ID: "1234",
 			Containers: []*kubecontainer.Container{
 				createTestContainer("c1", kubecontainer.ContainerStateExited),
 				createTestContainer("c2", kubecontainer.ContainerStateRunning),
 				createTestContainer("c3", kubecontainer.ContainerStateUnknown),
 			},
-		},
-		{
+		}},
+		{Pod: &kubecontainer.Pod{
 			ID: "4567",
 			Containers: []*kubecontainer.Container{
 				createTestContainer("c1", kubecontainer.ContainerStateExited),
 			},
-		},
+		}},
 	}
 	pleg.relist()
 	// Report every running/exited container if we see them for the first time.
@@ -123,31 +123,33 @@ func TestRelisting(t *testing.T) {
 	actual := getEventsFromChannel(ch)
 	verifyEvents(t, expected, actual)
 
-	// The second relist should not send out any event because no container
+	// The second relist should not send out any event because no container has
 	// changed.
 	pleg.relist()
 	verifyEvents(t, expected, actual)
 
-	runtime.AllPodList = []*kubecontainer.Pod{
-		{
+	runtime.AllPodList = []*containertest.FakePod{
+		{Pod: &kubecontainer.Pod{
 			ID: "1234",
 			Containers: []*kubecontainer.Container{
 				createTestContainer("c2", kubecontainer.ContainerStateExited),
 				createTestContainer("c3", kubecontainer.ContainerStateRunning),
 			},
-		},
-		{
+		}},
+		{Pod: &kubecontainer.Pod{
 			ID: "4567",
 			Containers: []*kubecontainer.Container{
 				createTestContainer("c4", kubecontainer.ContainerStateRunning),
 			},
-		},
+		}},
 	}
 	pleg.relist()
 	// Only report containers that transitioned to running or exited status.
 	expected = []*PodLifecycleEvent{
+		{ID: "1234", Type: ContainerRemoved, Data: "c1"},
 		{ID: "1234", Type: ContainerDied, Data: "c2"},
 		{ID: "1234", Type: ContainerStarted, Data: "c3"},
+		{ID: "4567", Type: ContainerRemoved, Data: "c1"},
 		{ID: "4567", Type: ContainerStarted, Data: "c4"},
 	}
 
@@ -169,15 +171,15 @@ func testReportMissingContainers(t *testing.T, numRelists int) {
 	testPleg := newTestGenericPLEG()
 	pleg, runtime := testPleg.pleg, testPleg.runtime
 	ch := pleg.Watch()
-	runtime.AllPodList = []*kubecontainer.Pod{
-		{
+	runtime.AllPodList = []*containertest.FakePod{
+		{Pod: &kubecontainer.Pod{
 			ID: "1234",
 			Containers: []*kubecontainer.Container{
 				createTestContainer("c1", kubecontainer.ContainerStateRunning),
 				createTestContainer("c2", kubecontainer.ContainerStateRunning),
 				createTestContainer("c3", kubecontainer.ContainerStateExited),
 			},
-		},
+		}},
 	}
 	// Relist and drain the events from the channel.
 	for i := 0; i < numRelists; i++ {
@@ -188,17 +190,19 @@ func testReportMissingContainers(t *testing.T, numRelists int) {
 	// Container c2 was stopped and removed between relists. We should report
 	// the event. The exited container c3 was garbage collected (i.e., removed)
 	// between relists. We should ignore that event.
-	runtime.AllPodList = []*kubecontainer.Pod{
-		{
+	runtime.AllPodList = []*containertest.FakePod{
+		{Pod: &kubecontainer.Pod{
 			ID: "1234",
 			Containers: []*kubecontainer.Container{
 				createTestContainer("c1", kubecontainer.ContainerStateRunning),
 			},
-		},
+		}},
 	}
 	pleg.relist()
 	expected := []*PodLifecycleEvent{
 		{ID: "1234", Type: ContainerDied, Data: "c2"},
+		{ID: "1234", Type: ContainerRemoved, Data: "c2"},
+		{ID: "1234", Type: ContainerRemoved, Data: "c3"},
 	}
 	actual := getEventsFromChannel(ch)
 	verifyEvents(t, expected, actual)
@@ -208,13 +212,13 @@ func testReportMissingPods(t *testing.T, numRelists int) {
 	testPleg := newTestGenericPLEG()
 	pleg, runtime := testPleg.pleg, testPleg.runtime
 	ch := pleg.Watch()
-	runtime.AllPodList = []*kubecontainer.Pod{
-		{
+	runtime.AllPodList = []*containertest.FakePod{
+		{Pod: &kubecontainer.Pod{
 			ID: "1234",
 			Containers: []*kubecontainer.Container{
 				createTestContainer("c2", kubecontainer.ContainerStateRunning),
 			},
-		},
+		}},
 	}
 	// Relist and drain the events from the channel.
 	for i := 0; i < numRelists; i++ {
@@ -224,10 +228,11 @@ func testReportMissingPods(t *testing.T, numRelists int) {
 
 	// Container c2 was stopped and removed between relists. We should report
 	// the event.
-	runtime.AllPodList = []*kubecontainer.Pod{}
+	runtime.AllPodList = []*containertest.FakePod{}
 	pleg.relist()
 	expected := []*PodLifecycleEvent{
 		{ID: "1234", Type: ContainerDied, Data: "c2"},
+		{ID: "1234", Type: ContainerRemoved, Data: "c2"},
 	}
 	actual := getEventsFromChannel(ch)
 	verifyEvents(t, expected, actual)
@@ -241,7 +246,7 @@ func newTestGenericPLEGWithRuntimeMock() (*GenericPLEG, *containertest.Mock) {
 		eventChannel: make(chan *PodLifecycleEvent, 100),
 		podRecords:   make(podRecords),
 		cache:        kubecontainer.NewCache(),
-		clock:        util.RealClock{},
+		clock:        clock.RealClock{},
 	}
 	return pleg, runtimeMock
 }
@@ -341,9 +346,11 @@ func TestRemoveCacheEntry(t *testing.T) {
 
 func TestHealthy(t *testing.T) {
 	testPleg := newTestGenericPLEG()
+
+	// pleg should initially be unhealthy
 	pleg, _, clock := testPleg.pleg, testPleg.runtime, testPleg.clock
 	ok, _ := pleg.Healthy()
-	assert.True(t, ok, "pleg should be healthy")
+	assert.False(t, ok, "pleg should be unhealthy")
 
 	// Advance the clock without any relisting.
 	clock.Step(time.Minute * 10)
@@ -356,6 +363,12 @@ func TestHealthy(t *testing.T) {
 	clock.Step(time.Minute * 1)
 	ok, _ = pleg.Healthy()
 	assert.True(t, ok, "pleg should be healthy")
+
+	// Advance by relistThreshold without any relisting. pleg should be unhealthy
+	// because it has been longer than relistThreshold since a relist occurred.
+	clock.Step(relistThreshold)
+	ok, _ = pleg.Healthy()
+	assert.False(t, ok, "pleg should be unhealthy")
 }
 
 func TestRelistWithReinspection(t *testing.T) {
@@ -424,4 +437,125 @@ func TestRelistWithReinspection(t *testing.T) {
 	// relist #3 forced the reinspection of the pod to retrieve its status, but because the list of
 	// containers was the same as relist #1, nothing "changed", so there are no new events.
 	assert.Exactly(t, []*PodLifecycleEvent{}, actualEvents)
+}
+
+// Test detecting sandbox state changes.
+func TestRelistingWithSandboxes(t *testing.T) {
+	testPleg := newTestGenericPLEG()
+	pleg, runtime := testPleg.pleg, testPleg.runtime
+	ch := pleg.Watch()
+	// The first relist should send a PodSync event to each pod.
+	runtime.AllPodList = []*containertest.FakePod{
+		{Pod: &kubecontainer.Pod{
+			ID: "1234",
+			Sandboxes: []*kubecontainer.Container{
+				createTestContainer("c1", kubecontainer.ContainerStateExited),
+				createTestContainer("c2", kubecontainer.ContainerStateRunning),
+				createTestContainer("c3", kubecontainer.ContainerStateUnknown),
+			},
+		}},
+		{Pod: &kubecontainer.Pod{
+			ID: "4567",
+			Sandboxes: []*kubecontainer.Container{
+				createTestContainer("c1", kubecontainer.ContainerStateExited),
+			},
+		}},
+	}
+	pleg.relist()
+	// Report every running/exited container if we see them for the first time.
+	expected := []*PodLifecycleEvent{
+		{ID: "1234", Type: ContainerStarted, Data: "c2"},
+		{ID: "4567", Type: ContainerDied, Data: "c1"},
+		{ID: "1234", Type: ContainerDied, Data: "c1"},
+	}
+	actual := getEventsFromChannel(ch)
+	verifyEvents(t, expected, actual)
+
+	// The second relist should not send out any event because no container has
+	// changed.
+	pleg.relist()
+	verifyEvents(t, expected, actual)
+
+	runtime.AllPodList = []*containertest.FakePod{
+		{Pod: &kubecontainer.Pod{
+			ID: "1234",
+			Sandboxes: []*kubecontainer.Container{
+				createTestContainer("c2", kubecontainer.ContainerStateExited),
+				createTestContainer("c3", kubecontainer.ContainerStateRunning),
+			},
+		}},
+		{Pod: &kubecontainer.Pod{
+			ID: "4567",
+			Sandboxes: []*kubecontainer.Container{
+				createTestContainer("c4", kubecontainer.ContainerStateRunning),
+			},
+		}},
+	}
+	pleg.relist()
+	// Only report containers that transitioned to running or exited status.
+	expected = []*PodLifecycleEvent{
+		{ID: "1234", Type: ContainerRemoved, Data: "c1"},
+		{ID: "1234", Type: ContainerDied, Data: "c2"},
+		{ID: "1234", Type: ContainerStarted, Data: "c3"},
+		{ID: "4567", Type: ContainerRemoved, Data: "c1"},
+		{ID: "4567", Type: ContainerStarted, Data: "c4"},
+	}
+
+	actual = getEventsFromChannel(ch)
+	verifyEvents(t, expected, actual)
+}
+
+func TestRelistIPChange(t *testing.T) {
+	pleg, runtimeMock := newTestGenericPLEGWithRuntimeMock()
+	ch := pleg.Watch()
+
+	id := types.UID("test-pod-0")
+	cState := kubecontainer.ContainerStateRunning
+	container := createTestContainer("c0", cState)
+	pod := &kubecontainer.Pod{
+		ID:         id,
+		Containers: []*kubecontainer.Container{container},
+	}
+	ipAddr := "192.168.1.5/24"
+	status := &kubecontainer.PodStatus{
+		ID:                id,
+		IP:                ipAddr,
+		ContainerStatuses: []*kubecontainer.ContainerStatus{{ID: container.ID, State: cState}},
+	}
+	event := &PodLifecycleEvent{ID: pod.ID, Type: ContainerStarted, Data: container.ID.ID}
+
+	runtimeMock.On("GetPods", true).Return([]*kubecontainer.Pod{pod}, nil).Once()
+	runtimeMock.On("GetPodStatus", pod.ID, "", "").Return(status, nil).Once()
+
+	pleg.relist()
+	actualEvents := getEventsFromChannel(ch)
+	actualStatus, actualErr := pleg.cache.Get(pod.ID)
+	assert.Equal(t, status, actualStatus, "test0")
+	assert.Nil(t, actualErr, "test0")
+	assert.Exactly(t, []*PodLifecycleEvent{event}, actualEvents)
+
+	// Clear the IP address and mark the container terminated
+	container = createTestContainer("c0", kubecontainer.ContainerStateExited)
+	pod = &kubecontainer.Pod{
+		ID:         id,
+		Containers: []*kubecontainer.Container{container},
+	}
+	status = &kubecontainer.PodStatus{
+		ID:                id,
+		ContainerStatuses: []*kubecontainer.ContainerStatus{{ID: container.ID, State: kubecontainer.ContainerStateExited}},
+	}
+	event = &PodLifecycleEvent{ID: pod.ID, Type: ContainerDied, Data: container.ID.ID}
+	runtimeMock.On("GetPods", true).Return([]*kubecontainer.Pod{pod}, nil).Once()
+	runtimeMock.On("GetPodStatus", pod.ID, "", "").Return(status, nil).Once()
+
+	pleg.relist()
+	actualEvents = getEventsFromChannel(ch)
+	actualStatus, actualErr = pleg.cache.Get(pod.ID)
+	// Must copy status to compare since its pointer gets passed through all
+	// the way to the event
+	statusCopy := *status
+	statusCopy.IP = ipAddr
+	assert.Equal(t, &statusCopy, actualStatus, "test0")
+	assert.Nil(t, actualErr, "test0")
+	assert.Exactly(t, []*PodLifecycleEvent{event}, actualEvents)
 }

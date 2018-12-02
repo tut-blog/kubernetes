@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package rafthttp
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -46,16 +47,16 @@ type snapshotSender struct {
 	stopc chan struct{}
 }
 
-func newSnapshotSender(tr *Transport, picker *urlPicker, from, to, cid types.ID, status *peerStatus, r Raft, errorc chan error) *snapshotSender {
+func newSnapshotSender(tr *Transport, picker *urlPicker, to types.ID, status *peerStatus) *snapshotSender {
 	return &snapshotSender{
-		from:   from,
+		from:   tr.ID,
 		to:     to,
-		cid:    cid,
+		cid:    tr.ClusterID,
 		tr:     tr,
 		picker: picker,
 		status: status,
-		r:      r,
-		errorc: errorc,
+		r:      tr.Raft,
+		errorc: tr.ErrorC,
 		stopc:  make(chan struct{}),
 	}
 }
@@ -63,9 +64,10 @@ func newSnapshotSender(tr *Transport, picker *urlPicker, from, to, cid types.ID,
 func (s *snapshotSender) stop() { close(s.stopc) }
 
 func (s *snapshotSender) send(merged snap.Message) {
-	m := merged.Message
-
 	start := time.Now()
+
+	m := merged.Message
+	to := types.ID(m.To).String()
 
 	body := createSnapBody(merged)
 	defer body.Close()
@@ -87,25 +89,32 @@ func (s *snapshotSender) send(merged snap.Message) {
 		}
 
 		s.picker.unreachable(u)
-		reportSentFailure(sendSnap, m)
 		s.status.deactivate(failureType{source: sendSnap, action: "post"}, err.Error())
 		s.r.ReportUnreachable(m.To)
 		// report SnapshotFailure to raft state machine. After raft state
 		// machine knows about it, it would pause a while and retry sending
 		// new snapshot message.
 		s.r.ReportSnapshot(m.To, raft.SnapshotFailure)
+		sentFailures.WithLabelValues(to).Inc()
+		snapshotSendFailures.WithLabelValues(to).Inc()
 		return
 	}
-	reportSentDuration(sendSnap, m, time.Since(start))
 	s.status.activate()
 	s.r.ReportSnapshot(m.To, raft.SnapshotFinish)
 	plog.Infof("database snapshot [index: %d, to: %s] sent out successfully", m.Snapshot.Metadata.Index, types.ID(m.To))
+
+	sentBytes.WithLabelValues(to).Add(float64(merged.TotalSize))
+
+	snapshotSend.WithLabelValues(to).Inc()
+	snapshotSendSeconds.WithLabelValues(to).Observe(time.Since(start).Seconds())
 }
 
 // post posts the given request.
 // It returns nil when request is sent out and processed successfully.
 func (s *snapshotSender) post(req *http.Request) (err error) {
-	cancel := httputil.RequestCanceler(s.tr.pipelineRt, req)
+	ctx, cancel := context.WithCancel(context.Background())
+	req = req.WithContext(ctx)
+	defer cancel()
 
 	type responseAndError struct {
 		resp *http.Response
@@ -131,7 +140,6 @@ func (s *snapshotSender) post(req *http.Request) (err error) {
 
 	select {
 	case <-s.stopc:
-		cancel()
 		return errStopped
 	case r := <-result:
 		if r.err != nil {
@@ -145,7 +153,7 @@ func createSnapBody(merged snap.Message) io.ReadCloser {
 	buf := new(bytes.Buffer)
 	enc := &messageEncoder{w: buf}
 	// encode raft message
-	if err := enc.encode(merged.Message); err != nil {
+	if err := enc.encode(&merged.Message); err != nil {
 		plog.Panicf("encode message error (%v)", err)
 	}
 

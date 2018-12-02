@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package exec
 
 import (
 	"fmt"
+	"io"
 	"testing"
 
 	"k8s.io/kubernetes/pkg/probe"
@@ -29,6 +30,10 @@ type FakeCmd struct {
 	err    error
 }
 
+func (f *FakeCmd) Run() error {
+	return nil
+}
+
 func (f *FakeCmd) CombinedOutput() ([]byte, error) {
 	return f.out, f.err
 }
@@ -38,6 +43,28 @@ func (f *FakeCmd) Output() ([]byte, error) {
 }
 
 func (f *FakeCmd) SetDir(dir string) {}
+
+func (f *FakeCmd) SetStdin(in io.Reader) {}
+
+func (f *FakeCmd) SetStdout(out io.Writer) {}
+
+func (f *FakeCmd) SetStderr(out io.Writer) {}
+
+func (f *FakeCmd) SetEnv(env []string) {}
+
+func (f *FakeCmd) Stop() {}
+
+func (f *FakeCmd) Start() error { return nil }
+
+func (f *FakeCmd) Wait() error { return nil }
+
+func (f *FakeCmd) StdoutPipe() (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func (f *FakeCmd) StderrPipe() (io.ReadCloser, error) {
+	return nil, nil
+}
 
 type fakeExitError struct {
 	exited     bool

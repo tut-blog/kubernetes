@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,8 +22,9 @@ KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 kube::golang::setup_env
+kube::etcd::install
 
-"${KUBE_ROOT}/hack/build-go.sh" cmd/kube-apiserver
+make -C "${KUBE_ROOT}" WHAT=cmd/kube-apiserver
 
 apiserver=$(kube::util::find-binary "kube-apiserver")
 
@@ -44,7 +45,7 @@ if [[ $ret -eq 0 ]]
 then
   echo "${SPECROOT} up to date."
 else
-  echo "${SPECROOT} is out of date. Please run hack/update-swagger-spec.sh"
+  echo "${SPECROOT} is out of date. Please run hack/update-swagger-spec.sh" >&2
   exit 1
 fi
 

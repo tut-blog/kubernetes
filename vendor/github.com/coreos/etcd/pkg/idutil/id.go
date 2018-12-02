@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,8 +32,8 @@ const (
 // a node member ID.
 //
 // The initial id is in this format:
-// High order byte is memberID, next 5 bytes are from timestamp,
-// and low order 2 bytes are 0s.
+// High order 2 bytes are from memberID, next 5 bytes are from timestamp,
+// and low order one byte is a counter.
 // | prefix   | suffix              |
 // | 2 bytes  | 5 bytes   | 1 byte  |
 // | memberID | timestamp | cnt     |

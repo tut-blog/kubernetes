@@ -1,14 +1,24 @@
 language: go
 
-before_install:
-  - go get github.com/axw/gocov/gocov
-  - go get github.com/mattn/goveralls
-  - go get golang.org/x/tools/cmd/cover
+go:
+  - 1.6.x
+  - 1.7.x
+  - 1.8.x
+  - 1.9.x
+  - 1.10.x
 
-install:
-  - mkdir -p "$GOPATH/src/google.golang.org"
-  - mv "$TRAVIS_BUILD_DIR" "$GOPATH/src/google.golang.org/grpc"
+matrix:
+  include:
+  - go: 1.10.x
+    env: RUN386=1
+
+go_import_path: google.golang.org/grpc
+
+before_install:
+  - if [[ -n "$RUN386" ]]; then export GOARCH=386; fi
+  - if [[ "$TRAVIS_GO_VERSION" = 1.10* && "$GOARCH" != "386" ]]; then ./vet.sh -install || exit 1; fi
 
 script:
-  - make test testrace
-  - make coverage
+  - if [[ "$TRAVIS_GO_VERSION" = 1.10* && "$GOARCH" != "386" ]]; then ./vet.sh || exit 1; fi
+  - make test || exit 1
+  - if [[ "$GOARCH" != "386" ]]; then make testrace; fi

@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +16,11 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
 	"path"
-
-	"golang.org/x/net/context"
 )
 
 var (
@@ -34,6 +33,12 @@ type User struct {
 	Roles    []string `json:"roles"`
 	Grant    []string `json:"grant,omitempty"`
 	Revoke   []string `json:"revoke,omitempty"`
+}
+
+// userListEntry is the user representation given by the server for ListUsers
+type userListEntry struct {
+	User  string `json:"user"`
+	Roles []Role `json:"roles"`
 }
 
 type UserRoles struct {
@@ -194,7 +199,7 @@ func (u *httpAuthUserAPI) ListUsers(ctx context.Context) ([]string, error) {
 	}
 
 	var userList struct {
-		Users []User `json:"users"`
+		Users []userListEntry `json:"users"`
 	}
 
 	if err = json.Unmarshal(body, &userList); err != nil {

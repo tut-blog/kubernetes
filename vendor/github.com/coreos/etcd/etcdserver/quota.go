@@ -1,4 +1,4 @@
-// Copyright 2016 CoreOS, Inc.
+// Copyright 2016 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,15 @@
 
 package etcdserver
 
-import (
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/storage/backend"
+import pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+
+const (
+	// DefaultQuotaBytes is the number of bytes the backend Size may
+	// consume before exceeding the space quota.
+	DefaultQuotaBytes = int64(2 * 1024 * 1024 * 1024) // 2GB
+	// MaxQuotaBytes is the maximum number of bytes suggested for a backend
+	// quota. A larger quota may lead to degraded performance.
+	MaxQuotaBytes = int64(8 * 1024 * 1024 * 1024) // 8GB
 )
 
 // Quota represents an arbitrary quota against arbitrary requests. Each request
@@ -50,20 +56,24 @@ const (
 )
 
 func NewBackendQuota(s *EtcdServer) Quota {
-	if s.cfg.QuotaBackendBytes < 0 {
+	quotaBackendBytes.Set(float64(s.Cfg.QuotaBackendBytes))
+
+	if s.Cfg.QuotaBackendBytes < 0 {
 		// disable quotas if negative
 		plog.Warningf("disabling backend quota")
 		return &passthroughQuota{}
 	}
-	if s.cfg.QuotaBackendBytes == 0 {
+
+	if s.Cfg.QuotaBackendBytes == 0 {
 		// use default size if no quota size given
-		return &backendQuota{s, backend.DefaultQuotaBytes}
+		quotaBackendBytes.Set(float64(DefaultQuotaBytes))
+		return &backendQuota{s, DefaultQuotaBytes}
 	}
-	if s.cfg.QuotaBackendBytes > backend.MaxQuotaBytes {
-		plog.Warningf("backend quota %v exceeds maximum quota %v; using maximum", s.cfg.QuotaBackendBytes, backend.MaxQuotaBytes)
-		return &backendQuota{s, backend.MaxQuotaBytes}
+
+	if s.Cfg.QuotaBackendBytes > MaxQuotaBytes {
+		plog.Warningf("backend quota %v exceeds maximum recommended quota %v", s.Cfg.QuotaBackendBytes, MaxQuotaBytes)
 	}
-	return &backendQuota{s, s.cfg.QuotaBackendBytes}
+	return &backendQuota{s, s.Cfg.QuotaBackendBytes}
 }
 
 func (b *backendQuota) Available(v interface{}) bool {
@@ -86,7 +96,7 @@ func (b *backendQuota) Cost(v interface{}) int {
 
 func costPut(r *pb.PutRequest) int { return kvOverhead + len(r.Key) + len(r.Value) }
 
-func costTxnReq(u *pb.RequestUnion) int {
+func costTxnReq(u *pb.RequestOp) int {
 	r := u.GetRequestPut()
 	if r == nil {
 		return 0

@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 package wal
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
-	"path"
-	"reflect"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -41,15 +41,18 @@ const (
 	crcType
 	snapshotType
 
-	// the owner can make/remove files inside the directory
-	privateDirMode = 0700
-
-	// the expected size of each wal segment file.
-	// the actual size might be bigger than it.
-	segmentSizeBytes = 64 * 1000 * 1000 // 64MB
+	// warnSyncDuration is the amount of time allotted to an fsync before
+	// logging a warning
+	warnSyncDuration = time.Second
 )
 
 var (
+	// SegmentSizeBytes is the preallocated size of each wal segment file.
+	// The actual size might be larger than this. In general, the default
+	// value should be used, but this is defined as an exported variable
+	// so that tests can set a different segment size.
+	SegmentSizeBytes int64 = 64 * 1000 * 1000 // 64MB
+
 	plog = capnslog.NewPackageLogger("github.com/coreos/etcd", "wal")
 
 	ErrMetadataConflict = errors.New("wal: conflicting metadata found")
@@ -66,7 +69,11 @@ var (
 // A just opened WAL is in read mode, and ready for reading records.
 // The WAL will be ready for appending after reading out all the previous records.
 type WAL struct {
-	dir      string           // the living directory of the underlay files
+	dir string // the living directory of the underlay files
+
+	// dirFile is a fd for the wal directory for syncing on Rename
+	dirFile *os.File
+
 	metadata []byte           // metadata recorded at the head of each WAL
 	state    raftpb.HardState // hardstate recorded at the head of WAL
 
@@ -89,39 +96,107 @@ func Create(dirpath string, metadata []byte) (*WAL, error) {
 		return nil, os.ErrExist
 	}
 
-	if err := os.MkdirAll(dirpath, privateDirMode); err != nil {
+	// keep temporary wal directory so WAL initialization appears atomic
+	tmpdirpath := filepath.Clean(dirpath) + ".tmp"
+	if fileutil.Exist(tmpdirpath) {
+		if err := os.RemoveAll(tmpdirpath); err != nil {
+			return nil, err
+		}
+	}
+	if err := fileutil.CreateDirAll(tmpdirpath); err != nil {
 		return nil, err
 	}
 
-	p := path.Join(dirpath, walName(0, 0))
-	f, err := fileutil.LockFile(p, os.O_WRONLY|os.O_CREATE, 0600)
+	p := filepath.Join(tmpdirpath, walName(0, 0))
+	f, err := fileutil.LockFile(p, os.O_WRONLY|os.O_CREATE, fileutil.PrivateFileMode)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := f.Seek(0, os.SEEK_END); err != nil {
+	if _, err = f.Seek(0, io.SeekEnd); err != nil {
 		return nil, err
 	}
-	if err := fileutil.Preallocate(f.File, segmentSizeBytes, true); err != nil {
+	if err = fileutil.Preallocate(f.File, SegmentSizeBytes, true); err != nil {
 		return nil, err
 	}
 
 	w := &WAL{
 		dir:      dirpath,
 		metadata: metadata,
-		encoder:  newEncoder(f, 0),
-		fp:       newFilePipeline(dirpath, segmentSizeBytes),
+	}
+	w.encoder, err = newFileEncoder(f.File, 0)
+	if err != nil {
+		return nil, err
 	}
 	w.locks = append(w.locks, f)
-	if err := w.saveCrc(0); err != nil {
+	if err = w.saveCrc(0); err != nil {
 		return nil, err
 	}
-	if err := w.encoder.encode(&walpb.Record{Type: metadataType, Data: metadata}); err != nil {
+	if err = w.encoder.encode(&walpb.Record{Type: metadataType, Data: metadata}); err != nil {
 		return nil, err
 	}
-	if err := w.SaveSnapshot(walpb.Snapshot{}); err != nil {
+	if err = w.SaveSnapshot(walpb.Snapshot{}); err != nil {
 		return nil, err
 	}
+
+	if w, err = w.renameWal(tmpdirpath); err != nil {
+		return nil, err
+	}
+
+	// directory was renamed; sync parent dir to persist rename
+	pdir, perr := fileutil.OpenDir(filepath.Dir(w.dir))
+	if perr != nil {
+		return nil, perr
+	}
+	if perr = fileutil.Fsync(pdir); perr != nil {
+		return nil, perr
+	}
+	if perr = pdir.Close(); err != nil {
+		return nil, perr
+	}
+
 	return w, nil
+}
+
+func (w *WAL) renameWal(tmpdirpath string) (*WAL, error) {
+	if err := os.RemoveAll(w.dir); err != nil {
+		return nil, err
+	}
+	// On non-Windows platforms, hold the lock while renaming. Releasing
+	// the lock and trying to reacquire it quickly can be flaky because
+	// it's possible the process will fork to spawn a process while this is
+	// happening. The fds are set up as close-on-exec by the Go runtime,
+	// but there is a window between the fork and the exec where another
+	// process holds the lock.
+	if err := os.Rename(tmpdirpath, w.dir); err != nil {
+		if _, ok := err.(*os.LinkError); ok {
+			return w.renameWalUnlock(tmpdirpath)
+		}
+		return nil, err
+	}
+	w.fp = newFilePipeline(w.dir, SegmentSizeBytes)
+	df, err := fileutil.OpenDir(w.dir)
+	w.dirFile = df
+	return w, err
+}
+
+func (w *WAL) renameWalUnlock(tmpdirpath string) (*WAL, error) {
+	// rename of directory with locked files doesn't work on windows/cifs;
+	// close the WAL to release the locks so the directory can be renamed.
+	plog.Infof("releasing file lock to rename %q to %q", tmpdirpath, w.dir)
+	w.Close()
+	if err := os.Rename(tmpdirpath, w.dir); err != nil {
+		return nil, err
+	}
+	// reopen and relock
+	newWAL, oerr := Open(w.dir, walpb.Snapshot{})
+	if oerr != nil {
+		return nil, oerr
+	}
+	if _, _, _, err := newWAL.ReadAll(); err != nil {
+		newWAL.Close()
+		return nil, err
+	}
+	return newWAL, nil
 }
 
 // Open opens the WAL at the given snap.
@@ -131,7 +206,14 @@ func Create(dirpath string, metadata []byte) (*WAL, error) {
 // the given snap. The WAL cannot be appended to before reading out all of its
 // previous records.
 func Open(dirpath string, snap walpb.Snapshot) (*WAL, error) {
-	return openAtIndex(dirpath, snap, true)
+	w, err := openAtIndex(dirpath, snap, true)
+	if err != nil {
+		return nil, err
+	}
+	if w.dirFile, err = fileutil.OpenDir(w.dir); err != nil {
+		return nil, err
+	}
+	return w, nil
 }
 
 // OpenForRead only opens the wal files for read.
@@ -141,13 +223,9 @@ func OpenForRead(dirpath string, snap walpb.Snapshot) (*WAL, error) {
 }
 
 func openAtIndex(dirpath string, snap walpb.Snapshot, write bool) (*WAL, error) {
-	names, err := fileutil.ReadDir(dirpath)
+	names, err := readWalNames(dirpath)
 	if err != nil {
 		return nil, err
-	}
-	names = checkWalNames(names)
-	if len(names) == 0 {
-		return nil, ErrFileNotFound
 	}
 
 	nameIndex, ok := searchIndex(names, snap.Index)
@@ -160,9 +238,9 @@ func openAtIndex(dirpath string, snap walpb.Snapshot, write bool) (*WAL, error) 
 	rs := make([]io.Reader, 0)
 	ls := make([]*fileutil.LockedFile, 0)
 	for _, name := range names[nameIndex:] {
-		p := path.Join(dirpath, name)
+		p := filepath.Join(dirpath, name)
 		if write {
-			l, err := fileutil.TryLockFile(p, os.O_RDWR, 0600)
+			l, err := fileutil.TryLockFile(p, os.O_RDWR, fileutil.PrivateFileMode)
 			if err != nil {
 				closeAll(rcs...)
 				return nil, err
@@ -170,7 +248,7 @@ func openAtIndex(dirpath string, snap walpb.Snapshot, write bool) (*WAL, error) 
 			ls = append(ls, l)
 			rcs = append(rcs, l)
 		} else {
-			rf, err := os.OpenFile(p, os.O_RDONLY, 0600)
+			rf, err := os.OpenFile(p, os.O_RDONLY, fileutil.PrivateFileMode)
 			if err != nil {
 				closeAll(rcs...)
 				return nil, err
@@ -196,18 +274,11 @@ func openAtIndex(dirpath string, snap walpb.Snapshot, write bool) (*WAL, error) 
 		// write reuses the file descriptors from read; don't close so
 		// WAL can append without dropping the file lock
 		w.readClose = nil
-
-		if _, _, err := parseWalName(path.Base(w.tail().Name())); err != nil {
+		if _, _, err := parseWalName(filepath.Base(w.tail().Name())); err != nil {
 			closer()
 			return nil, err
 		}
-		// don't resize file for preallocation in case tail is corrupted
-		if err := fileutil.Preallocate(w.tail().File, segmentSizeBytes, false); err != nil {
-			closer()
-			plog.Errorf("failed to allocate space when creating new wal file (%v)", err)
-			return nil, err
-		}
-		w.fp = newFilePipeline(w.dir, segmentSizeBytes)
+		w.fp = newFilePipeline(w.dir, SegmentSizeBytes)
 	}
 
 	return w, nil
@@ -242,7 +313,7 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 		case stateType:
 			state = mustUnmarshalState(rec.Data)
 		case metadataType:
-			if metadata != nil && !reflect.DeepEqual(metadata, rec.Data) {
+			if metadata != nil && !bytes.Equal(metadata, rec.Data) {
 				state.Reset()
 				return nil, state, nil, ErrMetadataConflict
 			}
@@ -287,6 +358,18 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 			state.Reset()
 			return nil, state, nil, err
 		}
+		// decodeRecord() will return io.EOF if it detects a zero record,
+		// but this zero record may be followed by non-zero records from
+		// a torn write. Overwriting some of these non-zero records, but
+		// not all, will cause CRC errors on WAL open. Since the records
+		// were never fully synced to disk in the first place, it's safe
+		// to zero them out to avoid any CRC errors from new writes.
+		if _, err = w.tail().Seek(w.decoder.lastOffset(), io.SeekStart); err != nil {
+			return nil, state, nil, err
+		}
+		if err = fileutil.ZeroToEnd(w.tail().File); err != nil {
+			return nil, state, nil, err
+		}
 	}
 
 	err = nil
@@ -305,9 +388,10 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 
 	if w.tail() != nil {
 		// create encoder (chain crc with the decoder), enable appending
-		_, err = w.tail().Seek(w.decoder.lastOffset(), os.SEEK_SET)
-		w.encoder = newEncoder(w.tail(), w.decoder.lastCRC())
-		lastIndexSaved.Set(float64(w.enti))
+		w.encoder, err = newFileEncoder(w.tail().File, w.decoder.lastCRC())
+		if err != nil {
+			return
+		}
 	}
 	w.decoder = nil
 
@@ -319,7 +403,7 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 // Then cut atomically rename temp wal file to a wal file.
 func (w *WAL) cut() error {
 	// close old wal file; truncate to avoid wasting space if an early cut
-	off, serr := w.tail().Seek(0, os.SEEK_CUR)
+	off, serr := w.tail().Seek(0, io.SeekCurrent)
 	if serr != nil {
 		return serr
 	}
@@ -330,7 +414,7 @@ func (w *WAL) cut() error {
 		return err
 	}
 
-	fpath := path.Join(w.dir, walName(w.seq()+1, w.enti+1))
+	fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
 
 	// create a temp wal file with name sequence + 1, or truncate the existing one
 	newTail, err := w.fp.Open()
@@ -341,7 +425,10 @@ func (w *WAL) cut() error {
 	// update writer and save the previous crc
 	w.locks = append(w.locks, newTail)
 	prevCrc := w.encoder.crc.Sum32()
-	w.encoder = newEncoder(w.tail(), prevCrc)
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
 	if err = w.saveCrc(prevCrc); err != nil {
 		return err
 	}
@@ -356,7 +443,7 @@ func (w *WAL) cut() error {
 		return err
 	}
 
-	off, err = w.tail().Seek(0, os.SEEK_CUR)
+	off, err = w.tail().Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
@@ -364,19 +451,27 @@ func (w *WAL) cut() error {
 	if err = os.Rename(newTail.Name(), fpath); err != nil {
 		return err
 	}
-	newTail.Close()
-
-	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, 0600); err != nil {
+	if err = fileutil.Fsync(w.dirFile); err != nil {
 		return err
 	}
-	if _, err = newTail.Seek(off, os.SEEK_SET); err != nil {
+
+	// reopen newTail with its new path so calls to Name() match the wal filename format
+	newTail.Close()
+
+	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
+		return err
+	}
+	if _, err = newTail.Seek(off, io.SeekStart); err != nil {
 		return err
 	}
 
 	w.locks[len(w.locks)-1] = newTail
 
 	prevCrc = w.encoder.crc.Sum32()
-	w.encoder = newEncoder(w.tail(), prevCrc)
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
 
 	plog.Infof("segmented wal file %v is created", fpath)
 	return nil
@@ -390,7 +485,13 @@ func (w *WAL) sync() error {
 	}
 	start := time.Now()
 	err := fileutil.Fdatasync(w.tail().File)
-	syncDurations.Observe(float64(time.Since(start)) / float64(time.Second))
+
+	duration := time.Since(start)
+	if duration > warnSyncDuration {
+		plog.Warningf("sync duration of %v, expected less than %v", duration, warnSyncDuration)
+	}
+	syncDurations.Observe(duration.Seconds())
+
 	return err
 }
 
@@ -402,11 +503,15 @@ func (w *WAL) ReleaseLockTo(index uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if len(w.locks) == 0 {
+		return nil
+	}
+
 	var smaller int
 	found := false
 
 	for i, l := range w.locks {
-		_, lockIndex, err := parseWalName(path.Base(l.Name()))
+		_, lockIndex, err := parseWalName(filepath.Base(l.Name()))
 		if err != nil {
 			return err
 		}
@@ -419,7 +524,7 @@ func (w *WAL) ReleaseLockTo(index uint64) error {
 
 	// if no lock index is greater than the release index, we can
 	// release lock up to the last one(excluding).
-	if !found && len(w.locks) != 0 {
+	if !found {
 		smaller = len(w.locks) - 1
 	}
 
@@ -460,7 +565,8 @@ func (w *WAL) Close() error {
 			plog.Errorf("failed to unlock during closing wal: %s", err)
 		}
 	}
-	return nil
+
+	return w.dirFile.Close()
 }
 
 func (w *WAL) saveEntry(e *raftpb.Entry) error {
@@ -471,7 +577,6 @@ func (w *WAL) saveEntry(e *raftpb.Entry) error {
 		return err
 	}
 	w.enti = e.Index
-	lastIndexSaved.Set(float64(w.enti))
 	return nil
 }
 
@@ -494,7 +599,7 @@ func (w *WAL) Save(st raftpb.HardState, ents []raftpb.Entry) error {
 		return nil
 	}
 
-	mustSync := mustSync(st, w.state, len(ents))
+	mustSync := raft.MustSync(st, w.state, len(ents))
 
 	// TODO(xiangli): no more reference operator
 	for i := range ents {
@@ -506,26 +611,26 @@ func (w *WAL) Save(st raftpb.HardState, ents []raftpb.Entry) error {
 		return err
 	}
 
-	curOff, err := w.tail().Seek(0, os.SEEK_CUR)
+	curOff, err := w.tail().Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
-	if curOff < segmentSizeBytes {
+	if curOff < SegmentSizeBytes {
 		if mustSync {
 			return w.sync()
 		}
 		return nil
 	}
 
-	// TODO: add a test for this code path when refactoring the tests
 	return w.cut()
 }
 
 func (w *WAL) SaveSnapshot(e walpb.Snapshot) error {
+	b := pbutil.MustMarshal(&e)
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	b := pbutil.MustMarshal(&e)
 	rec := &walpb.Record{Type: snapshotType, Data: b}
 	if err := w.encoder.encode(rec); err != nil {
 		return err
@@ -534,7 +639,6 @@ func (w *WAL) SaveSnapshot(e walpb.Snapshot) error {
 	if w.enti < e.Index {
 		w.enti = e.Index
 	}
-	lastIndexSaved.Set(float64(w.enti))
 	return w.sync()
 }
 
@@ -554,23 +658,11 @@ func (w *WAL) seq() uint64 {
 	if t == nil {
 		return 0
 	}
-	seq, _, err := parseWalName(path.Base(t.Name()))
+	seq, _, err := parseWalName(filepath.Base(t.Name()))
 	if err != nil {
 		plog.Fatalf("bad wal name %s (%v)", t.Name(), err)
 	}
 	return seq
-}
-
-func mustSync(st, prevst raftpb.HardState, entsnum int) bool {
-	// Persistent state on all servers:
-	// (Updated on stable storage before responding to RPCs)
-	// currentTerm
-	// votedFor
-	// log entries[]
-	if entsnum != 0 || st.Vote != prevst.Vote || st.Term != prevst.Term {
-		return true
-	}
-	return false
 }
 
 func closeAll(rcs ...io.ReadCloser) error {

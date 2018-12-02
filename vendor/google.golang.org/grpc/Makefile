@@ -1,16 +1,4 @@
-.PHONY: \
-	all \
-	deps \
-	updatedeps \
-	testdeps \
-	updatetestdeps \
-	build \
-	proto \
-	test \
-	testrace \
-	clean \
-
-all: test testrace
+all: vet test testrace
 
 deps:
 	go get -d -v google.golang.org/grpc/...
@@ -32,19 +20,29 @@ proto:
 		echo "error: protoc not installed" >&2; \
 		exit 1; \
 	fi
-	go get -v github.com/golang/protobuf/protoc-gen-go
-	for file in $$(git ls-files '*.proto'); do \
-		protoc -I $$(dirname $$file) --go_out=plugins=grpc:$$(dirname $$file) $$file; \
-	done
+	go generate google.golang.org/grpc/...
+
+vet:
+	./vet.sh
 
 test: testdeps
-	go test -v -cpu 1,4 google.golang.org/grpc/...
+	go test -cpu 1,4 -timeout 5m google.golang.org/grpc/...
 
 testrace: testdeps
-	go test -v -race -cpu 1,4 google.golang.org/grpc/...
+	go test -race -cpu 1,4 -timeout 7m google.golang.org/grpc/...
 
 clean:
-	go clean google.golang.org/grpc/...
+	go clean -i google.golang.org/grpc/...
 
-coverage: testdeps
-	./coverage.sh --coveralls
+.PHONY: \
+	all \
+	deps \
+	updatedeps \
+	testdeps \
+	updatetestdeps \
+	build \
+	proto \
+	vet \
+	test \
+	testrace \
+	clean

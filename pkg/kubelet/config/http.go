@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,24 +24,26 @@ import (
 	"net/http"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/util/wait"
 
-	"github.com/golang/glog"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog"
 )
 
 type sourceURL struct {
 	url         string
 	header      http.Header
-	nodeName    string
+	nodeName    types.NodeName
 	updates     chan<- interface{}
 	data        []byte
 	failureLogs int
 	client      *http.Client
 }
 
-func NewSourceURL(url string, header http.Header, nodeName string, period time.Duration, updates chan<- interface{}) {
+func NewSourceURL(url string, header http.Header, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) {
 	config := &sourceURL{
 		url:      url,
 		header:   header,
@@ -49,10 +51,10 @@ func NewSourceURL(url string, header http.Header, nodeName string, period time.D
 		updates:  updates,
 		data:     nil,
 		// Timing out requests leads to retries. This client is only used to
-		// read the the manifest URL passed to kubelet.
+		// read the manifest URL passed to kubelet.
 		client: &http.Client{Timeout: 10 * time.Second},
 	}
-	glog.V(1).Infof("Watching URL %s", url)
+	klog.V(1).Infof("Watching URL %s", url)
 	go wait.Until(config.run, period, wait.NeverStop)
 }
 
@@ -61,16 +63,16 @@ func (s *sourceURL) run() {
 		// Don't log this multiple times per minute. The first few entries should be
 		// enough to get the point across.
 		if s.failureLogs < 3 {
-			glog.Warningf("Failed to read pods from URL: %v", err)
+			klog.Warningf("Failed to read pods from URL: %v", err)
 		} else if s.failureLogs == 3 {
-			glog.Warningf("Failed to read pods from URL. Dropping verbosity of this message to V(4): %v", err)
+			klog.Warningf("Failed to read pods from URL. Dropping verbosity of this message to V(4): %v", err)
 		} else {
-			glog.V(4).Infof("Failed to read pods from URL: %v", err)
+			klog.V(4).Infof("Failed to read pods from URL: %v", err)
 		}
 		s.failureLogs++
 	} else {
 		if s.failureLogs > 0 {
-			glog.Info("Successfully read pods from URL.")
+			klog.Info("Successfully read pods from URL.")
 			s.failureLogs = 0
 		}
 	}
@@ -95,12 +97,12 @@ func (s *sourceURL) extractFromURL() error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%v: %v", s.url, resp.Status)
 	}
 	if len(data) == 0 {
 		// Emit an update with an empty PodList to allow HTTPSource to be marked as seen
-		s.updates <- kubetypes.PodUpdate{Pods: []*api.Pod{}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return fmt.Errorf("zero-length data received from %v", s.url)
 	}
 	// Short circuit if the data has not changed since the last time it was read.
@@ -116,7 +118,7 @@ func (s *sourceURL) extractFromURL() error {
 			// It parsed but could not be used.
 			return singlePodErr
 		}
-		s.updates <- kubetypes.PodUpdate{Pods: []*api.Pod{pod}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{pod}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return nil
 	}
 
@@ -127,7 +129,7 @@ func (s *sourceURL) extractFromURL() error {
 			// It parsed but could not be used.
 			return multiPodErr
 		}
-		pods := make([]*api.Pod, 0)
+		pods := make([]*v1.Pod, 0)
 		for i := range podList.Items {
 			pods = append(pods, &podList.Items[i])
 		}

@@ -1,4 +1,4 @@
-// Copyright 2016 CoreOS, Inc.
+// Copyright 2016 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,8 @@
 package schedule
 
 import (
+	"context"
 	"sync"
-
-	"golang.org/x/net/context"
 )
 
 type Job func(context.Context)
@@ -88,8 +87,6 @@ func (f *fifo) Schedule(j Job) {
 		}
 	}
 	f.pendings = append(f.pendings, j)
-
-	return
 }
 
 func (f *fifo) Pending() int {

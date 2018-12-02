@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,9 +18,8 @@ package utils
 
 import (
 	"io/ioutil"
-	"os"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 func MakeTempDirOrDie(prefix string, baseDir string) string {
@@ -29,10 +28,7 @@ func MakeTempDirOrDie(prefix string, baseDir string) string {
 	}
 	tempDir, err := ioutil.TempDir(baseDir, prefix)
 	if err != nil {
-		glog.Fatalf("Can't make a temp rootdir: %v", err)
-	}
-	if err = os.MkdirAll(tempDir, 0750); err != nil {
-		glog.Fatalf("Can't mkdir(%q): %v", tempDir, err)
+		klog.Fatalf("Can't make a temp rootdir: %v", err)
 	}
 	return tempDir
 }

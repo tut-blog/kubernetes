@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,26 +17,26 @@ limitations under the License.
 package app
 
 import (
-	"github.com/golang/glog"
-	"golang.org/x/exp/inotify"
+	"github.com/sigma/go-inotify"
+	"k8s.io/klog"
 )
 
 func watchForLockfileContention(path string, done chan struct{}) error {
 	watcher, err := inotify.NewWatcher()
 	if err != nil {
-		glog.Errorf("unable to create watcher for lockfile: %v", err)
+		klog.Errorf("unable to create watcher for lockfile: %v", err)
 		return err
 	}
 	if err = watcher.AddWatch(path, inotify.IN_OPEN|inotify.IN_DELETE_SELF); err != nil {
-		glog.Errorf("unable to watch lockfile: %v", err)
+		klog.Errorf("unable to watch lockfile: %v", err)
 		return err
 	}
 	go func() {
 		select {
 		case ev := <-watcher.Event:
-			glog.Infof("inotify event: %v", ev)
+			klog.Infof("inotify event: %v", ev)
 		case err = <-watcher.Error:
-			glog.Errorf("inotify watcher error: %v", err)
+			klog.Errorf("inotify watcher error: %v", err)
 		}
 		close(done)
 	}()

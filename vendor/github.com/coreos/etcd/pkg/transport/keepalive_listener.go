@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -79,7 +79,7 @@ func (l *tlsKeepaliveListener) Accept() (c net.Conn, err error) {
 	kac.SetKeepAlive(true)
 	kac.SetKeepAlivePeriod(30 * time.Second)
 	c = tls.Server(c, l.config)
-	return
+	return c, nil
 }
 
 // NewListener creates a Listener which accepts connections from an inner

@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,11 @@ source "${KUBE_ROOT}/cluster/kube-util.sh"
 
 echo "Bringing down cluster using provider: $KUBERNETES_PROVIDER"
 
+echo "... calling verify-prereqs" >&2
 verify-prereqs
+echo "... calling verify-kube-binaries" >&2
+verify-kube-binaries
+echo "... calling kube-down" >&2
 kube-down
 
 echo "Done"

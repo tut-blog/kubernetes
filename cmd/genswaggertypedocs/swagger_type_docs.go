@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 
-	kruntime "k8s.io/kubernetes/pkg/runtime"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
 
-	"github.com/golang/glog"
 	flag "github.com/spf13/pflag"
+	"k8s.io/klog"
 )
 
 var (
@@ -35,11 +34,10 @@ var (
 )
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
 	flag.Parse()
 
 	if *typeSrc == "" {
-		glog.Fatalf("Please define -s flag as it is the source file")
+		klog.Fatalf("Please define -s flag as it is the source file")
 	}
 
 	var funcOut io.Writer
@@ -48,7 +46,7 @@ func main() {
 	} else {
 		file, err := os.Create(*functionDest)
 		if err != nil {
-			glog.Fatalf("Couldn't open %v: %v", *functionDest, err)
+			klog.Fatalf("Couldn't open %v: %v", *functionDest, err)
 		}
 		defer file.Close()
 		funcOut = file

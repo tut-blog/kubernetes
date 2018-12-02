@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,17 +18,18 @@ package e2e
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/labels"
+	rbacv1beta1 "k8s.io/api/rbac/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	clientset "k8s.io/client-go/kubernetes"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubernetes/test/e2e/framework/testfiles"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -40,330 +41,44 @@ const (
 
 var _ = framework.KubeDescribe("[Feature:Example]", func() {
 	f := framework.NewDefaultFramework("examples")
-	// Customized ForEach wrapper for this test.
-	forEachPod := func(selectorKey string, selectorValue string, fn func(api.Pod)) {
-		f.NewClusterVerification(
-			framework.PodStateVerification{
-				Selectors:   map[string]string{selectorKey: selectorValue},
-				ValidPhases: []api.PodPhase{api.PodRunning},
-			}).ForEach(fn)
-	}
-	var c *client.Client
+
+	var c clientset.Interface
 	var ns string
 	BeforeEach(func() {
-		c = f.Client
+		c = f.ClientSet
 		ns = f.Namespace.Name
-	})
 
-	framework.KubeDescribe("Redis", func() {
-		It("should create and stop redis servers", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "examples/redis", file)
-			}
-			bootstrapYaml := mkpath("redis-master.yaml")
-			sentinelServiceYaml := mkpath("redis-sentinel-service.yaml")
-			sentinelControllerYaml := mkpath("redis-sentinel-controller.yaml")
-			controllerYaml := mkpath("redis-controller.yaml")
+		// this test wants powerful permissions.  Since the namespace names are unique, we can leave this
+		// lying around so we don't have to race any caches
+		framework.BindClusterRoleInNamespace(c.RbacV1beta1(), "edit", f.Namespace.Name,
+			rbacv1beta1.Subject{Kind: rbacv1beta1.ServiceAccountKind, Namespace: f.Namespace.Name, Name: "default"})
 
-			bootstrapPodName := "redis-master"
-			redisRC := "redis"
-			sentinelRC := "redis-sentinel"
-			nsFlag := fmt.Sprintf("--namespace=%v", ns)
-			expectedOnServer := "The server is now ready to accept connections"
-			expectedOnSentinel := "+monitor master"
-
-			By("starting redis bootstrap")
-			framework.RunKubectlOrDie("create", "-f", bootstrapYaml, nsFlag)
-			err := framework.WaitForPodRunningInNamespace(c, bootstrapPodName, ns)
-			Expect(err).NotTo(HaveOccurred())
-
-			_, err = framework.LookForStringInLog(ns, bootstrapPodName, "master", expectedOnServer, serverStartTimeout)
-			Expect(err).NotTo(HaveOccurred())
-			_, err = framework.LookForStringInLog(ns, bootstrapPodName, "sentinel", expectedOnSentinel, serverStartTimeout)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("setting up services and controllers")
-			framework.RunKubectlOrDie("create", "-f", sentinelServiceYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", sentinelControllerYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", controllerYaml, nsFlag)
-			label := labels.SelectorFromSet(labels.Set(map[string]string{"name": sentinelRC}))
-			err = framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			label = labels.SelectorFromSet(labels.Set(map[string]string{"name": redisRC}))
-			err = framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("scaling up the deployment")
-			framework.RunKubectlOrDie("scale", "rc", redisRC, "--replicas=3", nsFlag)
-			framework.RunKubectlOrDie("scale", "rc", sentinelRC, "--replicas=3", nsFlag)
-			framework.WaitForRCToStabilize(c, ns, redisRC, framework.PodReadyBeforeTimeout)
-			framework.WaitForRCToStabilize(c, ns, sentinelRC, framework.PodReadyBeforeTimeout)
-
-			By("checking up the services")
-			checkAllLogs := func() {
-				forEachPod("name", "redis", func(pod api.Pod) {
-					if pod.Name != bootstrapPodName {
-						_, err := framework.LookForStringInLog(ns, pod.Name, "redis", expectedOnServer, serverStartTimeout)
-						Expect(err).NotTo(HaveOccurred())
-					}
-				})
-				forEachPod("name", "redis-sentinel", func(pod api.Pod) {
-					if pod.Name != bootstrapPodName {
-						_, err := framework.LookForStringInLog(ns, pod.Name, "sentinel", expectedOnSentinel, serverStartTimeout)
-						Expect(err).NotTo(HaveOccurred())
-					}
-				})
-			}
-			checkAllLogs()
-
-			By("turning down bootstrap")
-			framework.RunKubectlOrDie("delete", "-f", bootstrapYaml, nsFlag)
-			err = framework.WaitForRCPodToDisappear(c, ns, redisRC, bootstrapPodName)
-			Expect(err).NotTo(HaveOccurred())
-			By("waiting for the new master election")
-			checkAllLogs()
-		})
-	})
-
-	framework.KubeDescribe("Celery-RabbitMQ", func() {
-		It("should create and stop celery+rabbitmq servers", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "examples", "celery-rabbitmq", file)
-			}
-			rabbitmqServiceYaml := mkpath("rabbitmq-service.yaml")
-			rabbitmqControllerYaml := mkpath("rabbitmq-controller.yaml")
-			celeryControllerYaml := mkpath("celery-controller.yaml")
-			flowerControllerYaml := mkpath("flower-controller.yaml")
-			flowerServiceYaml := mkpath("flower-service.yaml")
-			nsFlag := fmt.Sprintf("--namespace=%v", ns)
-
-			By("starting rabbitmq")
-			framework.RunKubectlOrDie("create", "-f", rabbitmqServiceYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", rabbitmqControllerYaml, nsFlag)
-			label := labels.SelectorFromSet(labels.Set(map[string]string{"component": "rabbitmq"}))
-			err := framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			forEachPod("component", "rabbitmq", func(pod api.Pod) {
-				_, err := framework.LookForStringInLog(ns, pod.Name, "rabbitmq", "Server startup complete", serverStartTimeout)
-				Expect(err).NotTo(HaveOccurred())
-			})
-			err = framework.WaitForEndpoint(c, ns, "rabbitmq-service")
-			Expect(err).NotTo(HaveOccurred())
-
-			By("starting celery")
-			framework.RunKubectlOrDie("create", "-f", celeryControllerYaml, nsFlag)
-			label = labels.SelectorFromSet(labels.Set(map[string]string{"component": "celery"}))
-			err = framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			forEachPod("component", "celery", func(pod api.Pod) {
-				_, err := framework.LookForStringInFile(ns, pod.Name, "celery", "/data/celery.log", " ready.", serverStartTimeout)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
-			By("starting flower")
-			framework.RunKubectlOrDie("create", "-f", flowerServiceYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", flowerControllerYaml, nsFlag)
-			label = labels.SelectorFromSet(labels.Set(map[string]string{"component": "flower"}))
-			err = framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			forEachPod("component", "flower", func(pod api.Pod) {
-				content, err := makeHttpRequestToService(c, ns, "flower-service", "/", framework.EndpointRegisterTimeout)
-				Expect(err).NotTo(HaveOccurred())
-				if !strings.Contains(content, "<title>Celery Flower</title>") {
-					framework.Failf("Flower HTTP request failed")
-				}
-			})
-		})
-	})
-
-	framework.KubeDescribe("Spark", func() {
-		It("should start spark master, driver and workers", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "examples", "spark", file)
-			}
-
-			// Override test-generated namespace to be as specified in Spark example
-			ns = "spark-cluster"
-			namespaceYaml := mkpath("namespace-spark-cluster.yaml")
-			framework.RunKubectlOrDie("create", "-f", namespaceYaml)
-
-			// TODO: Add Zepplin and Web UI to this example.
-			serviceYaml := mkpath("spark-master-service.yaml")
-			masterYaml := mkpath("spark-master-controller.yaml")
-			workerControllerYaml := mkpath("spark-worker-controller.yaml")
-			nsFlag := fmt.Sprintf("--namespace=%v", ns)
-
-			master := func() {
-				By("starting master")
-				framework.RunKubectlOrDie("create", "-f", serviceYaml, nsFlag)
-				framework.RunKubectlOrDie("create", "-f", masterYaml, nsFlag)
-				label := labels.SelectorFromSet(labels.Set(map[string]string{"component": "spark-master"}))
-				err := framework.WaitForPodsWithLabelRunning(c, ns, label)
-				Expect(err).NotTo(HaveOccurred())
-
-				framework.Logf("Now polling for Master startup...")
-
-				// Only one master pod: But its a natural way to look up pod names.
-				forEachPod("component", "spark-master", func(pod api.Pod) {
-					framework.Logf("Now waiting for master to startup in %v", pod.Name)
-					_, err := framework.LookForStringInLog(ns, pod.Name, "spark-master", "Starting Spark master at", serverStartTimeout)
-					Expect(err).NotTo(HaveOccurred())
-				})
-
-				By("waiting for master endpoint")
-				err = framework.WaitForEndpoint(c, ns, "spark-master")
-				Expect(err).NotTo(HaveOccurred())
-				forEachPod("component", "spark-master", func(pod api.Pod) {
-					_, maErr := framework.LookForStringInLog(f.Namespace.Name, pod.Name, "spark-master", "Starting Spark master at", serverStartTimeout)
-					if maErr != nil {
-						framework.Failf("Didn't find target string. error:", maErr)
-					}
-				})
-			}
-			worker := func() {
-				By("starting workers")
-				framework.Logf("Now starting Workers")
-				framework.RunKubectlOrDie("create", "-f", workerControllerYaml, nsFlag)
-				label := labels.SelectorFromSet(labels.Set(map[string]string{"component": "spark-worker"}))
-				err := framework.WaitForPodsWithLabelRunning(c, ns, label)
-				Expect(err).NotTo(HaveOccurred())
-
-				// For now, scaling is orthogonal to the core test.
-				// framework.ScaleRC(c, ns, "spark-worker-controller", 2, true)
-
-				framework.Logf("Now polling for worker startup...")
-				// ScaleRC(c, ns, "spark-worker-controller", 2, true)
-				framework.Logf("Now polling for worker startup...")
-				forEachPod("component", "spark-worker",
-					func(pod api.Pod) {
-						_, slaveErr := framework.LookForStringInLog(ns, pod.Name, "spark-worker", "Successfully registered with master", serverStartTimeout)
-						Expect(slaveErr).NotTo(HaveOccurred())
-					})
-			}
-			// Run the worker verification after we turn up the master.
-			defer worker()
-			master()
-		})
-	})
-
-	framework.KubeDescribe("Cassandra", func() {
-		It("should create and scale cassandra", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "examples", "cassandra", file)
-			}
-			serviceYaml := mkpath("cassandra-service.yaml")
-			controllerYaml := mkpath("cassandra-controller.yaml")
-			nsFlag := fmt.Sprintf("--namespace=%v", ns)
-
-			By("Starting the cassandra service")
-			framework.RunKubectlOrDie("create", "-f", serviceYaml, nsFlag)
-			framework.Logf("wait for service")
-			err := framework.WaitForService(c, ns, "cassandra", true, framework.Poll, framework.ServiceRespondingTimeout)
-			Expect(err).NotTo(HaveOccurred())
-
-			// Create an RC with n nodes in it.  Each node will then be verified.
-			By("Creating a Cassandra RC")
-			framework.RunKubectlOrDie("create", "-f", controllerYaml, nsFlag)
-			label := labels.SelectorFromSet(labels.Set(map[string]string{"app": "cassandra"}))
-			err = framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			forEachPod("app", "cassandra", func(pod api.Pod) {
-				framework.Logf("Verifying pod %v ", pod.Name)
-				_, err = framework.LookForStringInLog(ns, pod.Name, "cassandra", "Listening for thrift clients", serverStartTimeout)
-				Expect(err).NotTo(HaveOccurred())
-				_, err = framework.LookForStringInLog(ns, pod.Name, "cassandra", "Handshaking version", serverStartTimeout)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
-			By("Finding each node in the nodetool status lines")
-			forEachPod("app", "cassandra", func(pod api.Pod) {
-				output := framework.RunKubectlOrDie("exec", pod.Name, nsFlag, "--", "nodetool", "status")
-				if !strings.Contains(output, pod.Status.PodIP) {
-					framework.Failf("Pod ip %s not found in nodetool status", pod.Status.PodIP)
-				}
-			})
-		})
-	})
-
-	framework.KubeDescribe("Storm", func() {
-		It("should create and stop Zookeeper, Nimbus and Storm worker servers", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "examples", "storm", file)
-			}
-			zookeeperServiceJson := mkpath("zookeeper-service.json")
-			zookeeperPodJson := mkpath("zookeeper.json")
-			nimbusServiceJson := mkpath("storm-nimbus-service.json")
-			nimbusPodJson := mkpath("storm-nimbus.json")
-			workerControllerJson := mkpath("storm-worker-controller.json")
-			nsFlag := fmt.Sprintf("--namespace=%v", ns)
-			zookeeperPod := "zookeeper"
-
-			By("starting Zookeeper")
-			framework.RunKubectlOrDie("create", "-f", zookeeperPodJson, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", zookeeperServiceJson, nsFlag)
-			err := framework.WaitForPodRunningInNamespace(c, zookeeperPod, ns)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("checking if zookeeper is up and running")
-			_, err = framework.LookForStringInLog(ns, zookeeperPod, "zookeeper", "binding to port", serverStartTimeout)
-			Expect(err).NotTo(HaveOccurred())
-			err = framework.WaitForEndpoint(c, ns, "zookeeper")
-			Expect(err).NotTo(HaveOccurred())
-
-			By("starting Nimbus")
-			framework.RunKubectlOrDie("create", "-f", nimbusPodJson, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", nimbusServiceJson, nsFlag)
-			err = framework.WaitForPodRunningInNamespace(c, "nimbus", ns)
-			Expect(err).NotTo(HaveOccurred())
-
-			err = framework.WaitForEndpoint(c, ns, "nimbus")
-			Expect(err).NotTo(HaveOccurred())
-
-			By("starting workers")
-			framework.RunKubectlOrDie("create", "-f", workerControllerJson, nsFlag)
-			label := labels.SelectorFromSet(labels.Set(map[string]string{"name": "storm-worker"}))
-			err = framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			forEachPod("name", "storm-worker", func(pod api.Pod) {
-				//do nothing, just wait for the pod to be running
-			})
-			// TODO: Add logging configuration to nimbus & workers images and then
-			// look for a string instead of sleeping.
-			time.Sleep(20 * time.Second)
-
-			By("checking if there are established connections to Zookeeper")
-			_, err = framework.LookForStringInLog(ns, zookeeperPod, "zookeeper", "Established session", serverStartTimeout)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("checking if Nimbus responds to requests")
-			framework.LookForString("No topologies running.", time.Minute, func() string {
-				return framework.RunKubectlOrDie("exec", "nimbus", nsFlag, "--", "bin/storm", "list")
-			})
-		})
+		err := framework.WaitForAuthorizationUpdate(c.AuthorizationV1beta1(),
+			serviceaccount.MakeUsername(f.Namespace.Name, "default"),
+			f.Namespace.Name, "create", schema.GroupResource{Resource: "pods"}, true)
+		framework.ExpectNoError(err)
 	})
 
 	framework.KubeDescribe("Liveness", func() {
 		It("liveness pods should be automatically restarted", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "docs", "user-guide", "liveness", file)
-			}
-			execYaml := mkpath("exec-liveness.yaml")
-			httpYaml := mkpath("http-liveness.yaml")
+			test := "test/fixtures/doc-yaml/user-guide/liveness"
+			execYaml := readFile(test, "exec-liveness.yaml")
+			httpYaml := readFile(test, "http-liveness.yaml")
 			nsFlag := fmt.Sprintf("--namespace=%v", ns)
 
-			framework.RunKubectlOrDie("create", "-f", execYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", httpYaml, nsFlag)
+			framework.RunKubectlOrDieInput(execYaml, "create", "-f", "-", nsFlag)
+			framework.RunKubectlOrDieInput(httpYaml, "create", "-f", "-", nsFlag)
 
 			// Since both containers start rapidly, we can easily run this test in parallel.
 			var wg sync.WaitGroup
 			passed := true
 			checkRestart := func(podName string, timeout time.Duration) {
-				err := framework.WaitForPodRunningInNamespace(c, podName, ns)
+				err := framework.WaitForPodNameRunningInNamespace(c, podName, ns)
 				Expect(err).NotTo(HaveOccurred())
 				for t := time.Now(); time.Since(t) < timeout; time.Sleep(framework.Poll) {
-					pod, err := c.Pods(ns).Get(podName)
+					pod, err := c.CoreV1().Pods(ns).Get(podName, metav1.GetOptions{})
 					framework.ExpectNoError(err, fmt.Sprintf("getting pod %s", podName))
-					stat := api.GetExistingContainerStatus(pod.Status.ContainerStatuses, podName)
+					stat := podutil.GetExistingContainerStatus(pod.Status.ContainerStatuses, podName)
 					framework.Logf("Pod: %s, restart count:%d", stat.Name, stat.RestartCount)
 					if stat.RestartCount > 0 {
 						framework.Logf("Saw %v restart, succeeded...", podName)
@@ -394,17 +109,16 @@ var _ = framework.KubeDescribe("[Feature:Example]", func() {
 
 	framework.KubeDescribe("Secret", func() {
 		It("should create a pod that reads a secret", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "docs", "user-guide", "secrets", file)
-			}
-			secretYaml := mkpath("secret.yaml")
-			podYaml := mkpath("secret-pod.yaml")
+			test := "test/fixtures/doc-yaml/user-guide/secrets"
+			secretYaml := readFile(test, "secret.yaml")
+			podYaml := readFile(test, "secret-pod.yaml")
+
 			nsFlag := fmt.Sprintf("--namespace=%v", ns)
 			podName := "secret-test-pod"
 
 			By("creating secret and pod")
-			framework.RunKubectlOrDie("create", "-f", secretYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", podYaml, nsFlag)
+			framework.RunKubectlOrDieInput(secretYaml, "create", "-f", "-", nsFlag)
+			framework.RunKubectlOrDieInput(podYaml, "create", "-f", "-", nsFlag)
 			err := framework.WaitForPodNoLongerRunningInNamespace(c, podName, ns)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -416,15 +130,13 @@ var _ = framework.KubeDescribe("[Feature:Example]", func() {
 
 	framework.KubeDescribe("Downward API", func() {
 		It("should create a pod that prints his name and namespace", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "docs", "user-guide", "downward-api", file)
-			}
-			podYaml := mkpath("dapi-pod.yaml")
+			test := "test/fixtures/doc-yaml/user-guide/downward-api"
+			podYaml := readFile(test, "dapi-pod.yaml")
 			nsFlag := fmt.Sprintf("--namespace=%v", ns)
 			podName := "dapi-test-pod"
 
 			By("creating the pod")
-			framework.RunKubectlOrDie("create", "-f", podYaml, nsFlag)
+			framework.RunKubectlOrDieInput(podYaml, "create", "-f", "-", nsFlag)
 			err := framework.WaitForPodNoLongerRunningInNamespace(c, podName, ns)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -435,114 +147,9 @@ var _ = framework.KubeDescribe("[Feature:Example]", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
-
-	framework.KubeDescribe("RethinkDB", func() {
-		It("should create and stop rethinkdb servers", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "examples", "rethinkdb", file)
-			}
-			driverServiceYaml := mkpath("driver-service.yaml")
-			rethinkDbControllerYaml := mkpath("rc.yaml")
-			adminPodYaml := mkpath("admin-pod.yaml")
-			adminServiceYaml := mkpath("admin-service.yaml")
-			nsFlag := fmt.Sprintf("--namespace=%v", ns)
-
-			By("starting rethinkdb")
-			framework.RunKubectlOrDie("create", "-f", driverServiceYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", rethinkDbControllerYaml, nsFlag)
-			label := labels.SelectorFromSet(labels.Set(map[string]string{"db": "rethinkdb"}))
-			err := framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			checkDbInstances := func() {
-				forEachPod("db", "rethinkdb", func(pod api.Pod) {
-					_, err = framework.LookForStringInLog(ns, pod.Name, "rethinkdb", "Server ready", serverStartTimeout)
-					Expect(err).NotTo(HaveOccurred())
-				})
-			}
-			checkDbInstances()
-			err = framework.WaitForEndpoint(c, ns, "rethinkdb-driver")
-			Expect(err).NotTo(HaveOccurred())
-
-			By("scaling rethinkdb")
-			framework.ScaleRC(c, ns, "rethinkdb-rc", 2, true)
-			checkDbInstances()
-
-			By("starting admin")
-			framework.RunKubectlOrDie("create", "-f", adminServiceYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", adminPodYaml, nsFlag)
-			err = framework.WaitForPodRunningInNamespace(c, "rethinkdb-admin", ns)
-			Expect(err).NotTo(HaveOccurred())
-			checkDbInstances()
-			content, err := makeHttpRequestToService(c, ns, "rethinkdb-admin", "/", framework.EndpointRegisterTimeout)
-			Expect(err).NotTo(HaveOccurred())
-			if !strings.Contains(content, "<title>RethinkDB Administration Console</title>") {
-				framework.Failf("RethinkDB console is not running")
-			}
-		})
-	})
-
-	framework.KubeDescribe("Hazelcast", func() {
-		It("should create and scale hazelcast", func() {
-			mkpath := func(file string) string {
-				return filepath.Join(framework.TestContext.RepoRoot, "examples", "hazelcast", file)
-			}
-			serviceYaml := mkpath("hazelcast-service.yaml")
-			controllerYaml := mkpath("hazelcast-controller.yaml")
-			nsFlag := fmt.Sprintf("--namespace=%v", ns)
-
-			By("starting hazelcast")
-			framework.RunKubectlOrDie("create", "-f", serviceYaml, nsFlag)
-			framework.RunKubectlOrDie("create", "-f", controllerYaml, nsFlag)
-			label := labels.SelectorFromSet(labels.Set(map[string]string{"name": "hazelcast"}))
-			err := framework.WaitForPodsWithLabelRunning(c, ns, label)
-			Expect(err).NotTo(HaveOccurred())
-			forEachPod("name", "hazelcast", func(pod api.Pod) {
-				_, err := framework.LookForStringInLog(ns, pod.Name, "hazelcast", "Members [1]", serverStartTimeout)
-				Expect(err).NotTo(HaveOccurred())
-				_, err = framework.LookForStringInLog(ns, pod.Name, "hazelcast", "is STARTED", serverStartTimeout)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
-			err = framework.WaitForEndpoint(c, ns, "hazelcast")
-			Expect(err).NotTo(HaveOccurred())
-
-			By("scaling hazelcast")
-			framework.ScaleRC(c, ns, "hazelcast", 2, true)
-			forEachPod("name", "hazelcast", func(pod api.Pod) {
-				_, err := framework.LookForStringInLog(ns, pod.Name, "hazelcast", "Members [2]", serverStartTimeout)
-				Expect(err).NotTo(HaveOccurred())
-			})
-		})
-	})
 })
 
-func makeHttpRequestToService(c *client.Client, ns, service, path string, timeout time.Duration) (string, error) {
-	var result []byte
-	var err error
-	for t := time.Now(); time.Since(t) < timeout; time.Sleep(framework.Poll) {
-		proxyRequest, errProxy := framework.GetServicesProxyRequest(c, c.Get())
-		if errProxy != nil {
-			break
-		}
-		result, err = proxyRequest.Namespace(ns).
-			Name(service).
-			Suffix(path).
-			Do().
-			Raw()
-		if err != nil {
-			break
-		}
-	}
-	return string(result), err
-}
-
-// pass enough context with the 'old' parameter so that it replaces what your really intended.
-func prepareResourceWithReplacedString(inputFile, old, new string) string {
-	f, err := os.Open(inputFile)
-	Expect(err).NotTo(HaveOccurred())
-	defer f.Close()
-	data, err := ioutil.ReadAll(f)
-	Expect(err).NotTo(HaveOccurred())
-	podYaml := strings.Replace(string(data), old, new, 1)
-	return podYaml
+func readFile(test, file string) string {
+	from := filepath.Join(test, file)
+	return string(testfiles.ReadOrDie(from, Fail))
 }

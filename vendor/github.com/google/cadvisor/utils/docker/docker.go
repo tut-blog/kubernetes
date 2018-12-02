@@ -16,17 +16,19 @@ package docker
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
-	dockertypes "github.com/docker/engine-api/types"
+	dockertypes "github.com/docker/docker/api/types"
 )
 
 const (
-	DockerInfoDriver         = "Driver"
-	DockerInfoDriverStatus   = "DriverStatus"
-	DriverStatusPoolName     = "Pool Name"
-	DriverStatusDataLoopFile = "Data loop file"
-	DriverStatusMetadataFile = "Metadata file"
+	DockerInfoDriver          = "Driver"
+	DockerInfoDriverStatus    = "DriverStatus"
+	DriverStatusPoolName      = "Pool Name"
+	DriverStatusDataLoopFile  = "Data loop file"
+	DriverStatusMetadataFile  = "Metadata file"
+	DriverStatusParentDataset = "Parent Dataset"
 )
 
 func DriverStatusValue(status [][2]string, target string) string {
@@ -50,9 +52,29 @@ func DockerThinPoolName(info dockertypes.Info) (string, error) {
 
 func DockerMetadataDevice(info dockertypes.Info) (string, error) {
 	metadataDevice := DriverStatusValue(info.DriverStatus, DriverStatusMetadataFile)
-	if len(metadataDevice) == 0 {
-		return "", fmt.Errorf("Could not get the devicemapper metadata device")
+	if len(metadataDevice) != 0 {
+		return metadataDevice, nil
+	}
+
+	poolName, err := DockerThinPoolName(info)
+	if err != nil {
+		return "", err
+	}
+
+	metadataDevice = fmt.Sprintf("/dev/mapper/%s_tmeta", poolName)
+
+	if _, err := os.Stat(metadataDevice); err != nil {
+		return "", err
 	}
 
 	return metadataDevice, nil
+}
+
+func DockerZfsFilesystem(info dockertypes.Info) (string, error) {
+	filesystem := DriverStatusValue(info.DriverStatus, DriverStatusParentDataset)
+	if len(filesystem) == 0 {
+		return "", fmt.Errorf("Could not get zfs filesystem")
+	}
+
+	return filesystem, nil
 }

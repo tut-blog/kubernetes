@@ -1,4 +1,4 @@
-// Copyright 2015 CoreOS, Inc.
+// Copyright 2015 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,10 @@
 
 package fileutil
 
-import "os"
+import (
+	"io"
+	"os"
+)
 
 // Preallocate tries to allocate the space for given
 // file. This operation is only supported on linux by a
@@ -22,22 +25,26 @@ import "os"
 // If the operation is unsupported, no error will be returned.
 // Otherwise, the error encountered will be returned.
 func Preallocate(f *os.File, sizeInBytes int64, extendFile bool) error {
+	if sizeInBytes == 0 {
+		// fallocate will return EINVAL if length is 0; skip
+		return nil
+	}
 	if extendFile {
-		preallocExtend(f, sizeInBytes)
+		return preallocExtend(f, sizeInBytes)
 	}
 	return preallocFixed(f, sizeInBytes)
 }
 
 func preallocExtendTrunc(f *os.File, sizeInBytes int64) error {
-	curOff, err := f.Seek(0, os.SEEK_CUR)
+	curOff, err := f.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
-	size, err := f.Seek(sizeInBytes, os.SEEK_END)
+	size, err := f.Seek(sizeInBytes, io.SeekEnd)
 	if err != nil {
 		return err
 	}
-	if _, err = f.Seek(curOff, os.SEEK_SET); err != nil {
+	if _, err = f.Seek(curOff, io.SeekStart); err != nil {
 		return err
 	}
 	if sizeInBytes > size {

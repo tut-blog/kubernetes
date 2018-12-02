@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,108 +18,156 @@ package rollout
 
 import (
 	"fmt"
-	"io"
-
-	"k8s.io/kubernetes/pkg/kubectl"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/resource"
 
 	"github.com/spf13/cobra"
+
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericclioptions/printers"
+	"k8s.io/cli-runtime/pkg/genericclioptions/resource"
+	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/kubectl/polymorphichelpers"
+	"k8s.io/kubernetes/pkg/kubectl/scheme"
+	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
+	"k8s.io/kubernetes/pkg/kubectl/util/templates"
 )
 
-// HistoryOptions is the start of the data required to perform the operation.  As new fields are added, add them here instead of
-// referencing the cmd.Flags()
-type HistoryOptions struct {
-	Filenames []string
-	Recursive bool
+var (
+	history_long = templates.LongDesc(`
+		View previous rollout revisions and configurations.`)
+
+	history_example = templates.Examples(`
+		# View the rollout history of a deployment
+		kubectl rollout history deployment/abc
+
+		# View the details of daemonset revision 3
+		kubectl rollout history daemonset/abc --revision=3`)
+)
+
+type RolloutHistoryOptions struct {
+	PrintFlags *genericclioptions.PrintFlags
+	ToPrinter  func(string) (printers.ResourcePrinter, error)
+
+	Revision int64
+
+	Builder          func() *resource.Builder
+	Resources        []string
+	Namespace        string
+	EnforceNamespace bool
+
+	HistoryViewer    polymorphichelpers.HistoryViewerFunc
+	RESTClientGetter genericclioptions.RESTClientGetter
+
+	resource.FilenameOptions
+	genericclioptions.IOStreams
 }
 
-const (
-	history_long    = `View previous rollout revisions and configurations.`
-	history_example = `# View the rollout history of a deployment
-kubectl rollout history deployment/abc
+func NewRolloutHistoryOptions(streams genericclioptions.IOStreams) *RolloutHistoryOptions {
+	return &RolloutHistoryOptions{
+		PrintFlags: genericclioptions.NewPrintFlags("").WithTypeSetter(scheme.Scheme),
+		IOStreams:  streams,
+	}
+}
 
-# View the details of deployment revision 3
-kubectl rollout history deployment/abc --revision=3`
-)
+func NewCmdRolloutHistory(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+	o := NewRolloutHistoryOptions(streams)
 
-func NewCmdRolloutHistory(f *cmdutil.Factory, out io.Writer) *cobra.Command {
-	options := &HistoryOptions{}
+	validArgs := []string{"deployment", "daemonset", "statefulset"}
 
 	cmd := &cobra.Command{
-		Use:     "history (TYPE NAME | TYPE/NAME) [flags]",
-		Short:   "view rollout history",
-		Long:    history_long,
-		Example: history_example,
+		Use:                   "history (TYPE NAME | TYPE/NAME) [flags]",
+		DisableFlagsInUseLine: true,
+		Short:                 i18n.T("View rollout history"),
+		Long:                  history_long,
+		Example:               history_example,
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckErr(RunHistory(f, cmd, out, args, options))
+			cmdutil.CheckErr(o.Complete(f, cmd, args))
+			cmdutil.CheckErr(o.Validate())
+			cmdutil.CheckErr(o.Run())
 		},
+		ValidArgs: validArgs,
 	}
 
-	cmd.Flags().Int64("revision", 0, "See the details, including podTemplate of the revision specified")
-	usage := "Filename, directory, or URL to a file identifying the resource to get from a server."
-	kubectl.AddJsonFilenameFlag(cmd, &options.Filenames, usage)
-	cmdutil.AddRecursiveFlag(cmd, &options.Recursive)
+	cmd.Flags().Int64Var(&o.Revision, "revision", o.Revision, "See the details, including podTemplate of the revision specified")
+
+	usage := "identifying the resource to get from a server."
+	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, usage)
+
+	o.PrintFlags.AddFlags(cmd)
+
 	return cmd
 }
 
-func RunHistory(f *cmdutil.Factory, cmd *cobra.Command, out io.Writer, args []string, options *HistoryOptions) error {
-	if len(args) == 0 && len(options.Filenames) == 0 {
-		return cmdutil.UsageError(cmd, "Required resource not specified.")
-	}
-	revisionDetail := cmdutil.GetFlagInt64(cmd, "revision")
+func (o *RolloutHistoryOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
+	o.Resources = args
 
-	mapper, typer := f.Object(false)
-
-	cmdNamespace, enforceNamespace, err := f.DefaultNamespace()
-	if err != nil {
+	var err error
+	if o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace(); err != nil {
 		return err
 	}
 
-	r := resource.NewBuilder(mapper, typer, resource.ClientMapperFunc(f.ClientForMapping), f.Decoder(true)).
-		NamespaceParam(cmdNamespace).DefaultNamespace().
-		FilenameParam(enforceNamespace, options.Recursive, options.Filenames...).
-		ResourceTypeOrNameArgs(true, args...).
+	o.ToPrinter = func(operation string) (printers.ResourcePrinter, error) {
+		o.PrintFlags.NamePrintFlags.Operation = operation
+		return o.PrintFlags.ToPrinter()
+	}
+
+	o.HistoryViewer = polymorphichelpers.HistoryViewerFn
+	o.RESTClientGetter = f
+	o.Builder = f.NewBuilder
+
+	return nil
+}
+
+func (o *RolloutHistoryOptions) Validate() error {
+	if len(o.Resources) == 0 && cmdutil.IsFilenameSliceEmpty(o.Filenames) {
+		return fmt.Errorf("required resource not specified")
+	}
+	if o.Revision < 0 {
+		return fmt.Errorf("revision must be a positive integer: %v", o.Revision)
+	}
+
+	return nil
+}
+
+func (o *RolloutHistoryOptions) Run() error {
+
+	r := o.Builder().
+		WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).
+		NamespaceParam(o.Namespace).DefaultNamespace().
+		FilenameParam(o.EnforceNamespace, &o.FilenameOptions).
+		ResourceTypeOrNameArgs(true, o.Resources...).
 		ContinueOnError().
 		Latest().
 		Flatten().
 		Do()
-	err = r.Err()
-	if err != nil {
+	if err := r.Err(); err != nil {
 		return err
 	}
 
-	err = r.Visit(func(info *resource.Info, err error) error {
-		if err != nil {
-			return err
-		}
-		mapping := info.ResourceMapping()
-		historyViewer, err := f.HistoryViewer(mapping)
-		if err != nil {
-			return err
-		}
-		historyInfo, err := historyViewer.History(info.Namespace, info.Name)
+	return r.Visit(func(info *resource.Info, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if revisionDetail > 0 {
-			// Print details of a specific revision
-			template, ok := historyInfo.RevisionToTemplate[revisionDetail]
-			if !ok {
-				return fmt.Errorf("unable to find revision %d of %s %q", revisionDetail, mapping.Resource, info.Name)
-			}
-			fmt.Fprintf(out, "%s %q revision %d\n", mapping.Resource, info.Name, revisionDetail)
-			kubectl.DescribePodTemplate(template, out)
-		} else {
-			// Print all revisions
-			formattedOutput, printErr := kubectl.PrintRolloutHistory(historyInfo, mapping.Resource, info.Name)
-			if printErr != nil {
-				return printErr
-			}
-			fmt.Fprintf(out, "%s\n", formattedOutput)
+		mapping := info.ResourceMapping()
+		historyViewer, err := o.HistoryViewer(o.RESTClientGetter, mapping)
+		if err != nil {
+			return err
 		}
-		return nil
+		historyInfo, err := historyViewer.ViewHistory(info.Namespace, info.Name, o.Revision)
+		if err != nil {
+			return err
+		}
+
+		withRevision := ""
+		if o.Revision > 0 {
+			withRevision = fmt.Sprintf("with revision #%d", o.Revision)
+		}
+
+		printer, err := o.ToPrinter(fmt.Sprintf("%s\n%s", withRevision, historyInfo))
+		if err != nil {
+			return err
+		}
+
+		return printer.PrintObj(info.Object, o.Out)
 	})
-	return err
 }
